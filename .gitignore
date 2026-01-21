@@ -142,7 +142,9 @@ orchestrator*.log
 orchestrator.log.*
 failed_tasks.json
 failure_analysis_report_*.md
-*test*.py
+# Temp test scripts (but not tests/ directory)
+/scripts/*test*.py
+/*test*.py
 *temp*.py
 
 # IDE
