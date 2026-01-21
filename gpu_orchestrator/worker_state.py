@@ -361,6 +361,12 @@ class ScalingDecision:
     at_max_capacity: bool
     at_min_capacity: bool
 
+    # New fields for observability (reactive vs proactive scaling)
+    spawn_reason_tasks: int = 0      # Workers spawned to cover uncovered tasks
+    spawn_reason_floor: int = 0      # Workers spawned for floor maintenance
+    uncovered_tasks: int = 0         # Queued tasks without coverage
+    workers_covering_tasks: int = 0  # Idle + spawning workers
+
     @property
     def should_scale_up(self) -> bool:
         return self.workers_to_spawn > 0
@@ -368,6 +374,136 @@ class ScalingDecision:
     @property
     def should_scale_down(self) -> bool:
         return self.workers_to_terminate > 0
+
+
+def calculate_scaling_decision_pure(
+    worker_states: list,  # List[DerivedWorkerState]
+    task_counts: TaskCounts,
+    config: 'OrchestratorConfig',
+    failure_rate_ok: bool,
+) -> ScalingDecision:
+    """
+    Pure function to calculate scaling decision with no I/O.
+
+    Separates reactive scaling (cover queued tasks) from proactive scaling
+    (maintain buffer/minimum) to prevent double-spawning.
+
+    Args:
+        worker_states: List of derived worker states
+        task_counts: Current task counts
+        config: Orchestrator configuration
+        failure_rate_ok: Whether failure rate allows spawning
+
+    Returns:
+        ScalingDecision with spawn/terminate recommendations
+    """
+    import math
+
+    # Count workers by state (exclude those marked for termination)
+    active_states = [ws for ws in worker_states if ws.is_active and not ws.should_terminate]
+    spawning_states = [ws for ws in worker_states if ws.is_spawning and not ws.should_terminate]
+
+    active_count = len(active_states)
+    spawning_count = len(spawning_states)
+    current_capacity = active_count + spawning_count
+
+    # Count idle vs busy among active workers
+    idle_count = len([ws for ws in active_states if not ws.has_active_task])
+    busy_count = active_count - idle_count
+
+    # =========================================================================
+    # NEW SCALING LOGIC: Separate reactive from proactive
+    # =========================================================================
+
+    # 1. Reactive scaling: Cover queued tasks
+    # Workers that can take tasks: idle active workers + spawning workers
+    workers_covering_tasks = idle_count + spawning_count
+    uncovered_tasks = max(0, task_counts.queued - workers_covering_tasks)
+    spawn_for_tasks = uncovered_tasks
+
+    # 2. Proactive scaling: Maintain floor (only if not already spawning)
+    # Floor = max(min_active_gpus, busy_count + machines_to_keep_idle)
+    desired_floor = max(config.min_active_gpus, busy_count + config.machines_to_keep_idle)
+
+    # Account for workers we're about to spawn for tasks
+    capacity_after_task_spawns = current_capacity + spawn_for_tasks
+
+    # Only spawn for floor if no workers are currently spawning
+    if spawning_count == 0:
+        spawn_for_floor = max(0, desired_floor - capacity_after_task_spawns)
+    else:
+        spawn_for_floor = 0
+
+    # Exception: Always allow spawning to reach minimum (even if spawning in progress)
+    min_gap = max(0, config.min_active_gpus - capacity_after_task_spawns)
+    spawn_for_floor = max(spawn_for_floor, min_gap)
+
+    workers_to_spawn = spawn_for_tasks + spawn_for_floor
+
+    # =========================================================================
+    # Legacy fields for backwards compatibility
+    # =========================================================================
+    total_workload = task_counts.total_workload
+    if total_workload > 0:
+        up_scaled = math.ceil(total_workload * config.scale_up_multiplier)
+        task_based = max(1, up_scaled)
+    else:
+        task_based = 0
+
+    buffer_based = busy_count + config.machines_to_keep_idle
+    min_based = config.min_active_gpus
+
+    desired = max(min_based, task_based, buffer_based)
+    desired = min(desired, config.max_active_gpus)
+
+    # =========================================================================
+    # Apply constraints
+    # =========================================================================
+
+    # Don't spawn if failure rate is too high
+    if not failure_rate_ok:
+        workers_to_spawn = 0
+
+    # Don't spawn beyond max capacity
+    max_spawnable = config.max_active_gpus - current_capacity
+    workers_to_spawn = min(workers_to_spawn, max(0, max_spawnable))
+
+    # Update spawn_for_tasks and spawn_for_floor after constraints
+    # (proportionally reduce if constrained)
+    if workers_to_spawn < spawn_for_tasks + spawn_for_floor and workers_to_spawn > 0:
+        # Prioritize tasks over floor
+        actual_spawn_for_tasks = min(spawn_for_tasks, workers_to_spawn)
+        actual_spawn_for_floor = workers_to_spawn - actual_spawn_for_tasks
+    else:
+        actual_spawn_for_tasks = spawn_for_tasks if workers_to_spawn > 0 else 0
+        actual_spawn_for_floor = spawn_for_floor if workers_to_spawn > 0 else 0
+
+    # Calculate scale-down (if over capacity)
+    workers_to_terminate = 0
+    if current_capacity > desired:
+        workers_to_terminate = current_capacity - desired
+
+    return ScalingDecision(
+        desired_workers=desired,
+        current_capacity=current_capacity,
+        active_count=active_count,
+        spawning_count=spawning_count,
+        idle_count=idle_count,
+        busy_count=busy_count,
+        task_based_workers=task_based,
+        buffer_based_workers=buffer_based,
+        min_based_workers=min_based,
+        workers_to_spawn=workers_to_spawn,
+        workers_to_terminate=workers_to_terminate,
+        failure_rate_ok=failure_rate_ok,
+        at_max_capacity=current_capacity >= config.max_active_gpus,
+        at_min_capacity=active_count <= config.min_active_gpus,
+        # New observability fields
+        spawn_reason_tasks=actual_spawn_for_tasks,
+        spawn_reason_floor=actual_spawn_for_floor,
+        uncovered_tasks=uncovered_tasks,
+        workers_covering_tasks=workers_covering_tasks,
+    )
 
 
 @dataclass

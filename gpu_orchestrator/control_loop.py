@@ -24,6 +24,7 @@ from .worker_state import (
     TaskCounts,
     ScalingDecision,
     CycleSummary,
+    calculate_scaling_decision_pure,
 )
 from .database import DatabaseClient
 from .runpod_client import create_runpod_client, spawn_runpod_gpu, terminate_runpod_gpu
@@ -674,6 +675,32 @@ class OrchestratorControlLoop:
         """Calculate desired workers and scaling actions."""
         config = self.config
 
+        # Check failure rate (async operation)
+        failure_rate_ok = await self._check_worker_failure_rate()
+
+        if config.use_new_scaling_logic:
+            # New scaling logic: uses pure function that separates reactive from proactive
+            decision = calculate_scaling_decision_pure(
+                worker_states, task_counts, config, failure_rate_ok
+            )
+        else:
+            # Legacy scaling logic (for rollback)
+            decision = self._calculate_scaling_decision_legacy(
+                worker_states, task_counts, failure_rate_ok
+            )
+
+        self._log_scaling_decision(decision, task_counts)
+        return decision
+
+    def _calculate_scaling_decision_legacy(
+        self,
+        worker_states: List[DerivedWorkerState],
+        task_counts: TaskCounts,
+        failure_rate_ok: bool,
+    ) -> ScalingDecision:
+        """Legacy scaling logic (before double-spawn fix)."""
+        config = self.config
+
         # Count workers by state
         active_states = [ws for ws in worker_states if ws.is_active and not ws.should_terminate]
         spawning_states = [ws for ws in worker_states if ws.is_spawning]
@@ -701,9 +728,6 @@ class OrchestratorControlLoop:
         desired = max(min_based, task_based, buffer_based)
         desired = min(desired, config.max_active_gpus)
 
-        # Check failure rate
-        failure_rate_ok = await self._check_worker_failure_rate()
-
         # Calculate actions
         workers_to_spawn = 0
         workers_to_terminate = 0
@@ -713,7 +737,7 @@ class OrchestratorControlLoop:
         elif current_capacity > desired:
             workers_to_terminate = current_capacity - desired
 
-        decision = ScalingDecision(
+        return ScalingDecision(
             desired_workers=desired,
             current_capacity=current_capacity,
             active_count=active_count,
@@ -730,9 +754,6 @@ class OrchestratorControlLoop:
             at_min_capacity=active_count <= config.min_active_gpus,
         )
 
-        self._log_scaling_decision(decision, task_counts)
-        return decision
-
     def _log_scaling_decision(self, decision: ScalingDecision, task_counts: TaskCounts):
         """Log scaling decision details."""
         import sys
@@ -746,11 +767,26 @@ class OrchestratorControlLoop:
         logger.info(f"   Current: {decision.idle_count} idle + {decision.busy_count} busy = {decision.active_count} active, {decision.spawning_count} spawning")
         logger.info(f"   Failure rate check: {'PASS' if decision.failure_rate_ok else 'FAIL (blocking scale-up)'}")
 
+        # Log new scaling logic breakdown if using new logic
+        if self.config.use_new_scaling_logic:
+            logger.info("   NEW SCALING LOGIC:")
+            logger.info(f"     Queued tasks: {task_counts.queued}")
+            logger.info(f"     Workers covering tasks: {decision.workers_covering_tasks} (idle + spawning)")
+            logger.info(f"     Uncovered tasks: {decision.uncovered_tasks}")
+            logger.info(f"     Spawn for tasks: {decision.spawn_reason_tasks}")
+            logger.info(f"     Spawn for floor: {decision.spawn_reason_floor}")
+
         print(f"\n{'=' * 80}", file=sys.stderr)
         print(f"SCALING DECISION (Cycle #{self.cycle_count})", file=sys.stderr)
         print(f"  Tasks: {task_counts.queued} queued + {task_counts.active_cloud} active = {task_counts.total_workload} total", file=sys.stderr)
         print(f"  Current: {decision.active_count} active + {decision.spawning_count} spawning = {decision.current_capacity} total", file=sys.stderr)
-        print(f"  Desired: {decision.desired_workers} workers", file=sys.stderr)
+
+        # Show new breakdown for stderr output
+        if self.config.use_new_scaling_logic:
+            print(f"  Task coverage: {decision.workers_covering_tasks} workers can cover {task_counts.queued} queued ({decision.uncovered_tasks} uncovered)", file=sys.stderr)
+            print(f"  Spawn breakdown: {decision.spawn_reason_tasks} for tasks + {decision.spawn_reason_floor} for floor = {decision.workers_to_spawn} total", file=sys.stderr)
+        else:
+            print(f"  Desired: {decision.desired_workers} workers", file=sys.stderr)
 
         if decision.should_scale_up:
             print(f"  Decision: SCALE UP by {decision.workers_to_spawn}", file=sys.stderr)

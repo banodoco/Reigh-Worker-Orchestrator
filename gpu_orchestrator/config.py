@@ -63,6 +63,9 @@ class OrchestratorConfig:
     # Auto-start worker process
     auto_start_worker_process: bool
 
+    # Feature flags
+    use_new_scaling_logic: bool
+
     @classmethod
     def from_env(cls) -> 'OrchestratorConfig':
         """Load all config from environment with defaults."""
@@ -133,6 +136,9 @@ class OrchestratorConfig:
 
             # Auto-start
             auto_start_worker_process=os.getenv("AUTO_START_WORKER_PROCESS", "true").lower() == "true",
+
+            # Feature flags
+            use_new_scaling_logic=os.getenv("USE_NEW_SCALING_LOGIC", "true").lower() == "true",
         )
 
     def log_config(self):
@@ -149,3 +155,4 @@ class OrchestratorConfig:
         logger.info(f"   Storage: check_interval={self.storage_check_interval_cycles} cycles, min_free={self.storage_min_free_gb}GB, max_used={self.storage_max_percent_used}%")
         logger.info(f"   Polling: {self.orchestrator_poll_sec}s")
         logger.info(f"   Auto-start worker: {self.auto_start_worker_process}")
+        logger.info(f"   Feature flags: use_new_scaling_logic={self.use_new_scaling_logic}")
