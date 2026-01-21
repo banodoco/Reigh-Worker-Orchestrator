@@ -37,7 +37,7 @@ def ssh_to_worker(runpod_id: str):
     # Check worker log file - try both possible log file names
     result = runpod_client.execute_command_on_worker(
         runpod_id,
-        f"ls -la /workspace/Headless-Wan2GP/logs/*{runpod_id}* 2>/dev/null || ls -la /workspace/Headless-Wan2GP/logs/gpu-* | head -5"
+        f"ls -la /workspace/Headless-Wan2GP/logs/*{runpod_id}* 2>/dev/null || ls -la /workspace/Headless-Wan2GP/logs/gpu-* 2>/dev/null | head -5 || ls -la /workspace/Reigh-Worker/logs/*{runpod_id}* 2>/dev/null || ls -la /workspace/Reigh-Worker/logs/gpu-* 2>/dev/null | head -5"
     )
 
     if result and result[1] == 0:

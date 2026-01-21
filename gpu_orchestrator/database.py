@@ -292,6 +292,23 @@ class DatabaseClient:
             logger.error(f"Failed to check running tasks for worker {worker_id}: {e}")
             return False
     
+    async def has_worker_ever_claimed_task(self, worker_id: str) -> bool:
+        """Check if a worker has ever been assigned any task (any status).
+        
+        Used to detect workers that started but never successfully claimed work,
+        indicating potential GPU initialization failures or other startup issues.
+        """
+        try:
+            # Check if ANY task has ever been assigned to this worker
+            result = self.supabase.table('tasks').select('id').eq('worker_id', worker_id).limit(1).execute()
+            
+            return len(result.data or []) > 0
+            
+        except Exception as e:
+            logger.error(f"Failed to check if worker {worker_id} ever claimed tasks: {e}")
+            # Return True on error to avoid false terminations
+            return True
+    
     async def get_running_tasks_for_worker(self, worker_id: str) -> List[Dict[str, Any]]:
         """Get all running tasks for a worker."""
         try:
@@ -537,7 +554,74 @@ class DatabaseClient:
                     logger.warning(f"Reset {count} stale tasks (IDs truncated)")
             
             return count
-            
+
         except Exception as e:
             logger.error(f"Failed to reset stale assigned tasks: {e}")
             return 0
+
+    # Batch operations for efficiency
+    async def batch_check_ever_claimed(self, worker_ids: List[str]) -> Dict[str, bool]:
+        """
+        Check if multiple workers have ever claimed tasks in one query.
+
+        Returns a dict mapping worker_id -> has_ever_claimed (bool).
+        Much more efficient than N separate queries.
+
+        NOTE: We don't use .limit() here because it could cause false negatives.
+        If worker A has 100 tasks, limit(N) might return all rows for A and miss B.
+        We deduplicate into a set anyway, so no limit is needed.
+        """
+        if not worker_ids:
+            return {}
+
+        try:
+            # Get worker_ids that have ever had a task assigned
+            # No limit - we deduplicate into a set, and the in_() filter
+            # ensures we only get rows for workers we care about
+            result = self.supabase.table('tasks') \
+                .select('worker_id') \
+                .in_('worker_id', worker_ids) \
+                .execute()
+
+            # Build set of workers that have claimed tasks (deduplication happens here)
+            claimed_workers = {r['worker_id'] for r in (result.data or []) if r.get('worker_id')}
+
+            # Return dict for all requested workers
+            return {wid: wid in claimed_workers for wid in worker_ids}
+
+        except Exception as e:
+            logger.error(f"Failed to batch check ever_claimed: {e}")
+            # Return True on error to avoid false terminations
+            return {wid: True for wid in worker_ids}
+
+    async def batch_check_active_tasks(self, worker_ids: List[str]) -> Dict[str, bool]:
+        """
+        Check if multiple workers have active (In Progress) tasks in one query.
+
+        Returns a dict mapping worker_id -> has_active_task (bool).
+        Much more efficient than N separate queries.
+
+        NOTE: No limit needed - "In Progress" tasks are naturally limited (one per worker
+        typically), and we deduplicate into a set anyway.
+        """
+        if not worker_ids:
+            return {}
+
+        try:
+            # Get worker_ids that have active tasks
+            result = self.supabase.table('tasks') \
+                .select('worker_id') \
+                .in_('worker_id', worker_ids) \
+                .eq('status', 'In Progress') \
+                .execute()
+
+            # Build set of workers with active tasks (deduplication happens here)
+            active_workers = {r['worker_id'] for r in (result.data or []) if r.get('worker_id')}
+
+            # Return dict for all requested workers
+            return {wid: wid in active_workers for wid in worker_ids}
+
+        except Exception as e:
+            logger.error(f"Failed to batch check active_tasks: {e}")
+            # Return False on error to be conservative
+            return {wid: False for wid in worker_ids}

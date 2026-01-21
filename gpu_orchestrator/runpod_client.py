@@ -100,7 +100,8 @@ def create_pod_and_wait(api_key: str, gpu_type_id: str, image_name: str, name: s
                        network_volume_id: str | None = None, volume_mount_path: str = "/workspace", 
                        disk_in_gb: int = 20, container_disk_in_gb: int = 10, wait_timeout: int = 600, 
                        public_key_string: str | None = None, env_vars: Dict[str, str] = None,
-                       min_vcpu_count: int = 8, min_memory_in_gb: int = 32):
+                       min_vcpu_count: int = 8, min_memory_in_gb: int = 32,
+                       template_id: str | None = None):
     """Create a RunPod pod and wait until it is running."""
     runpod.api_key = api_key
 
@@ -116,6 +117,10 @@ def create_pod_and_wait(api_key: str, gpu_type_id: str, image_name: str, name: s
         "min_memory_in_gb": min_memory_in_gb,
         "ports": "22/tcp,8888/http",
     }
+    
+    # Use template if provided (includes Jupyter auto-start)
+    if template_id:
+        params["template_id"] = template_id
 
     if network_volume_id:
         params["network_volume_id"] = network_volume_id
@@ -351,6 +356,8 @@ class RunpodClient:
         # Configuration from environment (matching user's example)
         self.gpu_type = os.getenv("RUNPOD_GPU_TYPE", "NVIDIA GeForce RTX 4090")
         self.worker_image = os.getenv("RUNPOD_WORKER_IMAGE", "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04")
+        # Template ID for auto-starting Jupyter (use template instead of raw image)
+        self.template_id = os.getenv("RUNPOD_TEMPLATE_ID", "runpod-torch-v240")
         self.storage_name = os.getenv("RUNPOD_STORAGE_NAME")  # Like "Peter" in your example
         self.volume_mount_path = os.getenv("RUNPOD_VOLUME_MOUNT_PATH", "/workspace")
         self.disk_size_gb = int(os.getenv("RUNPOD_DISK_SIZE_GB", "50"))
@@ -772,6 +779,7 @@ class RunpodClient:
                         min_memory_in_gb=ram_tier,
                         public_key_string=public_key_content,
                         env_vars=env_vars,
+                        template_id=self.template_id,
                     )
                     
                     if pod_details and 'id' in pod_details:
@@ -815,10 +823,15 @@ class RunpodClient:
     
 
     
-    def start_worker_process(self, runpod_id: str, worker_id: str) -> bool:
+    def start_worker_process(self, runpod_id: str, worker_id: str, has_pending_tasks: bool = False) -> bool:
         """
         Start the actual worker process in the background.
         This runs the worker.py script with Supabase configuration.
+        
+        Args:
+            runpod_id: The RunPod pod ID
+            worker_id: The worker ID
+            has_pending_tasks: If True, skip model preloading so worker can claim tasks faster
         """
         # Ensure environment variables are loaded
         from dotenv import load_dotenv
@@ -844,124 +857,150 @@ export SUPABASE_SERVICE_ROLE_KEY="{supabase_service_key}"
 export SUPABASE_SERVICE_KEY="{supabase_service_key}"
 export REPLICATE_API_TOKEN="{os.getenv('REPLICATE_API_TOKEN', '')}"
 
-# Check if Headless-Wan2GP exists, install if not
-if [ ! -d "/workspace/Headless-Wan2GP" ]; then
-    echo "📦 Headless-Wan2GP not found, installing..."
-    cd /workspace || exit 1
-    
-    echo "Step 1: Cloning repository..."
+# Non-interactive apt
+export DEBIAN_FRONTEND=noninteractive
+
+# ------------------------------------------------------------
+# EARLY LOGGING (must exist before any apt/network operations)
+# ------------------------------------------------------------
+# Write all stdout/stderr to a single per-worker log from the very beginning.
+LOG_FILE="/tmp/worker_startup_{worker_id}.log"
+APT_UPDATE_LOG="/tmp/apt-update-{worker_id}.log"
+APT_INSTALL_LOG="/tmp/apt-install-{worker_id}.log"
+mkdir -p /tmp
+touch "$LOG_FILE"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo "========================================="
+echo "🚀 WORKER STARTUP SCRIPT EXECUTION BEGIN"
+echo "========================================="
+echo "Worker ID: $WORKER_ID"
+echo "Timestamp: $(date -Iseconds)"
+echo "Initial PWD: $(pwd)"
+echo "USER: $(whoami)"
+echo "Kernel: $(uname -a | head -c 200)"
+echo "Log file: $LOG_FILE"
+echo
+
+# Error handling with useful tails
+trap 'echo "❌ SCRIPT FAILED at line $LINENO with exit code $? at $(date -Iseconds)"; \
+      echo "--- tail $APT_UPDATE_LOG"; tail -200 "$APT_UPDATE_LOG" 2>/dev/null || true; \
+      echo "--- tail $APT_INSTALL_LOG"; tail -200 "$APT_INSTALL_LOG" 2>/dev/null || true; \
+      exit 1' ERR
+
+# Apt helper with timeouts/retries (prevents indefinite hangs)
+apt_retry() {{
+    local name="$1"
+    local timeout_sec="$2"
+    shift 2
+    local attempt rc
+    for attempt in 1 2 3; do
+        echo "📦 $name (attempt $attempt/3, timeout ${{timeout_sec}}s): $*"
+        rm -f "$APT_UPDATE_LOG" "$APT_INSTALL_LOG" 2>/dev/null || true
+        if timeout "$timeout_sec" "$@" ; then
+            echo "✅ $name succeeded"
+            return 0
+        fi
+        rc=$?
+        echo "⚠️  $name failed (rc=$rc)"
+        # Show recent output if we captured any
+        tail -80 "$APT_UPDATE_LOG" 2>/dev/null || true
+        tail -80 "$APT_INSTALL_LOG" 2>/dev/null || true
+        sleep $((attempt * 5))
+    done
+    echo "❌ $name failed after 3 attempts"
+    return 1
+}}
+
+# Pick worker repo directory (supports both legacy + renamed repo)
+WORKSPACE_DIR="/workspace"
+PRIMARY_DIR="$WORKSPACE_DIR/Headless-Wan2GP"
+FALLBACK_DIR="$WORKSPACE_DIR/Reigh-Worker"
+
+if [ -d "$PRIMARY_DIR" ]; then
+    WORKDIR="$PRIMARY_DIR"
+    echo "✅ Using worker directory: $WORKDIR"
+elif [ -d "$FALLBACK_DIR" ]; then
+    WORKDIR="$FALLBACK_DIR"
+    echo "⚠️  Headless-Wan2GP not found; using fallback worker directory: $WORKDIR"
+else
+    echo "📦 Neither Headless-Wan2GP nor Reigh-Worker found. Cloning Headless-Wan2GP into $PRIMARY_DIR..."
+    cd "$WORKSPACE_DIR" || exit 1
     git clone https://github.com/peteromallet/Headless-Wan2GP || exit 1
-    
-    cd Headless-Wan2GP || exit 1
-    
-    echo "Step 2: Installing system dependencies (python3.10-venv ffmpeg)..."
-    apt-get update > /tmp/apt-update.log 2>&1
-    apt-get install -y python3.10-venv ffmpeg > /tmp/apt-install.log 2>&1
-    if [ $? -eq 0 ]; then
-        echo "✅ Dependencies installed successfully"
-    else
-        echo "❌ Dependency installation failed, see /tmp/apt-install.log"
-        tail -20 /tmp/apt-install.log
-        exit 1
-    fi
-    
-    echo "Step 3: Creating virtual environment..."
+    WORKDIR="$PRIMARY_DIR"
+fi
+
+# Ensure a stable log location in the repo (symlink to /tmp early log)
+LOG_DIR="$WORKDIR/logs"
+mkdir -p "$LOG_DIR"
+ln -sf "$LOG_FILE" "$LOG_DIR/{worker_id}.log" || true
+echo "🔗 Log symlink: $LOG_DIR/{worker_id}.log -> $LOG_FILE"
+
+# Start Jupyter Lab immediately so it's available while worker initializes
+echo "🚀 Starting Jupyter Lab on port 8888 (root: /workspace)..."
+cd /workspace
+nohup jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --ServerApp.token='' --ServerApp.password='' --ServerApp.root_dir=/workspace > /var/log/jupyter.log 2>&1 &
+JUPYTER_PID=$!
+echo "✅ Jupyter Lab started (PID: $JUPYTER_PID)"
+
+cd "$WORKDIR" || exit 1
+
+# Ensure core system dependencies exist (needed for venv + video processing)
+echo "Installing system dependencies (python3.10-venv ffmpeg git curl wget)..."
+# Use explicit logs for postmortem; command output also goes to $LOG_FILE via exec/tee.
+apt_retry "apt-get update" 300 bash -lc "apt-get -o Dpkg::Use-Pty=0 -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update > '$APT_UPDATE_LOG' 2>&1"
+apt_retry "apt-get install" 600 bash -lc "apt-get -o Dpkg::Use-Pty=0 -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y python3.10-venv ffmpeg git curl wget > '$APT_INSTALL_LOG' 2>&1"
+echo "✅ System dependencies installed"
+
+# Check if venv exists, if not create it and install dependencies
+if [ ! -d "venv" ] || [ ! -f "venv/bin/activate" ]; then
+    echo "⚠️  Virtual environment missing or incomplete, building..."
+
+    echo "Creating virtual environment..."
     python3.10 -m venv venv || exit 1
-    
-    echo "Step 4: Activating venv and installing PyTorch..."
+
+    echo "Activating venv and installing PyTorch..."
     source venv/bin/activate || exit 1
     pip install --no-cache-dir torch==2.6.0 torchvision torchaudio -f https://download.pytorch.org/whl/cu124 || exit 1
-    
-    echo "Step 5: Installing Wan2GP requirements..."
-    pip install --no-cache-dir -r Wan2GP/requirements.txt || exit 1
-    
-    echo "Step 6: Installing worker requirements..."
-    pip install --no-cache-dir -r requirements.txt || exit 1
-    
-    echo "✅ Headless-Wan2GP installation complete"
-else
-    echo "✅ Headless-Wan2GP already exists at /workspace/Headless-Wan2GP"
-    cd /workspace/Headless-Wan2GP || exit 1
-    
-    # Check if venv exists, if not create it and install dependencies
-    if [ ! -d "venv" ] || [ ! -f "venv/bin/activate" ]; then
-        echo "⚠️  Virtual environment missing or incomplete, rebuilding..."
-        
-        echo "Step 1: Installing system dependencies (python3.10-venv ffmpeg)..."
-        apt-get update > /tmp/apt-update.log 2>&1
-        apt-get install -y python3.10-venv ffmpeg > /tmp/apt-install.log 2>&1
-        if [ $? -eq 0 ]; then
-            echo "✅ Dependencies installed successfully"
-        else
-            echo "❌ Dependency installation failed, see /tmp/apt-install.log"
-            tail -20 /tmp/apt-install.log
-            exit 1
-        fi
-        
-        echo "Step 2: Creating virtual environment..."
-        python3.10 -m venv venv || exit 1
-        
-        echo "Step 3: Activating venv..."
-        source venv/bin/activate || exit 1
-        
-        echo "Step 4: Installing PyTorch..."
-        pip install --no-cache-dir torch==2.6.0 torchvision torchaudio -f https://download.pytorch.org/whl/cu124 || exit 1
-        
-        echo "Step 5: Installing Wan2GP requirements..."
+
+    if [ -f Wan2GP/requirements.txt ]; then
+        echo "Installing Wan2GP requirements..."
         pip install --no-cache-dir -r Wan2GP/requirements.txt || exit 1
-        
-        echo "Step 6: Installing worker requirements..."
-        pip install --no-cache-dir -r requirements.txt || exit 1
-        
-        echo "✅ Virtual environment rebuild complete"
-    else
-        echo "✅ Virtual environment exists, activating..."
-        source venv/bin/activate || exit 1
-        
-        # Check if dependencies are installed by testing for a key package
-        if ! python -c "import torch, dotenv" 2>/dev/null; then
-            echo "⚠️  Dependencies missing in venv, installing..."
-            
-            echo "Installing PyTorch..."
-            pip install --no-cache-dir torch==2.6.0 torchvision torchaudio -f https://download.pytorch.org/whl/cu124 || exit 1
-            
+    fi
+
+    echo "Installing worker requirements..."
+    pip install --no-cache-dir -r requirements.txt || exit 1
+
+    echo "✅ Virtual environment build complete"
+else
+    echo "✅ Virtual environment exists, activating..."
+    source venv/bin/activate || exit 1
+
+    # Check if dependencies are installed by testing for a key package
+    if ! python -c "import torch, dotenv" 2>/dev/null; then
+        echo "⚠️  Dependencies missing in venv, installing..."
+
+        echo "Installing PyTorch..."
+        pip install --no-cache-dir torch==2.6.0 torchvision torchaudio -f https://download.pytorch.org/whl/cu124 || exit 1
+
+        if [ -f Wan2GP/requirements.txt ]; then
             echo "Installing Wan2GP requirements..."
             pip install --no-cache-dir -r Wan2GP/requirements.txt || exit 1
-            
-            echo "Installing worker requirements..."
-            pip install --no-cache-dir -r requirements.txt || exit 1
-            
-            echo "✅ Dependencies installed"
-        else
-            echo "✅ Dependencies already installed"
         fi
+
+        echo "Installing worker requirements..."
+        pip install --no-cache-dir -r requirements.txt || exit 1
+
+        echo "✅ Dependencies installed"
+    else
+        echo "✅ Dependencies already installed"
     fi
 fi
 
-# Create logs directory FIRST (critical for debugging)
-mkdir -p /workspace/Headless-Wan2GP/logs
+echo "✅ Entering worker directory: $WORKDIR"
 
-# Initialize comprehensive logging IMMEDIATELY
-LOG_FILE="/workspace/Headless-Wan2GP/logs/{worker_id}.log"
-echo "=========================================" > "$LOG_FILE"
-echo "🚀 WORKER STARTUP SCRIPT EXECUTION BEGIN" >> "$LOG_FILE"
-echo "=========================================" >> "$LOG_FILE"
-echo "Script PID: $$" >> "$LOG_FILE"
-echo "Timestamp: $(date)" >> "$LOG_FILE"
-echo "Initial PWD: $(pwd)" >> "$LOG_FILE"
-echo "USER: $(whoami)" >> "$LOG_FILE"
-echo "Shell: $0" >> "$LOG_FILE"
-echo "Environment vars: $(env | wc -l) total" >> "$LOG_FILE"
-echo "Log file: $LOG_FILE" >> "$LOG_FILE"
-
-# Set up error handling with detailed error reporting
-set -e  # Exit on any error
-trap 'echo "❌ SCRIPT FAILED at line $LINENO with exit code $? at $(date)" >> "$LOG_FILE"; exit 1' ERR
-
-echo "✅ Changing to workspace directory..." >> "$LOG_FILE"
-
-# Change to workspace directory
-cd /workspace/Headless-Wan2GP/
+# Change to worker directory
+cd "$WORKDIR"
 
 echo "✅ Now in directory: $(pwd)" >> "$LOG_FILE" 2>&1
 echo "✅ Directory contents:" >> "$LOG_FILE" 2>&1
@@ -977,31 +1016,20 @@ BEFORE_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 echo "Before commit: $BEFORE_COMMIT" >> "$LOG_FILE" 2>&1
 
 # Perform pull with timeout and record exit status
-timeout 30 git pull origin main >> "$LOG_FILE" 2>&1
-GIT_PULL_EXIT=$?
-if [ "$GIT_PULL_EXIT" -ne 0 ]; then
-    echo "Git pull failed or timed out (exit $GIT_PULL_EXIT), continuing with existing code" >> "$LOG_FILE" 2>&1
-fi
+# Use || true to prevent set -e from exiting on failure (divergent branches, conflicts, etc.)
+timeout 30 git pull --ff-only origin main >> "$LOG_FILE" 2>&1 || {{
+    GIT_PULL_EXIT=$?
+    echo "Git pull failed (exit $GIT_PULL_EXIT), trying git reset --hard to sync with remote..." >> "$LOG_FILE" 2>&1
+    # Reset to remote state to handle divergent branches
+    git fetch origin main >> "$LOG_FILE" 2>&1 || true
+    git reset --hard origin/main >> "$LOG_FILE" 2>&1 || {{
+        echo "Git reset also failed, continuing with existing code" >> "$LOG_FILE" 2>&1
+    }}
+}}
 
 # Capture commit after pull to detect if code actually changed
 AFTER_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 echo "After commit:  $AFTER_COMMIT" >> "$LOG_FILE" 2>&1
-
-# Install essential dependencies if needed (quietly)
-echo "=== INSTALLING DEPENDENCIES ===" >> $LOG_FILE 2>&1
-echo "Installing dependencies (python3.10-venv ffmpeg git curl wget)..."
-apt-get update > /tmp/apt-update.log 2>&1
-apt-get install -y python3.10-venv ffmpeg git curl wget > /tmp/apt-install.log 2>&1
-if [ $? -eq 0 ]; then
-    echo "✅ Dependencies installed successfully"
-    echo "✅ Dependencies installed successfully" >> $LOG_FILE 2>&1
-else
-    echo "❌ Dependency installation failed, see /tmp/apt-install.log"
-    echo "ERROR: Dependency installation failed!" >> $LOG_FILE 2>&1
-    tail -20 /tmp/apt-install.log
-    tail -20 /tmp/apt-install.log >> $LOG_FILE 2>&1
-    exit 1
-fi
 
 # Verify critical dependencies
 echo "=== VERIFYING DEPENDENCIES ===" >> $LOG_FILE 2>&1
@@ -1031,47 +1059,108 @@ echo "Virtual env activated: $VIRTUAL_ENV" >> $LOG_FILE 2>&1
 echo "Python path: $(which python)" >> $LOG_FILE 2>&1
 echo "Python version: $(python --version)" >> $LOG_FILE 2>&1
 
-# If repo updated successfully, update Python dependencies
-echo "=== DEPENDENCY UPDATE (conditional) ===" >> $LOG_FILE 2>&1
-if [ "${{GIT_PULL_EXIT:-1}}" -eq 0 ] && [ "$BEFORE_COMMIT" != "$AFTER_COMMIT" ]; then
-    echo "Git updated code ($BEFORE_COMMIT -> $AFTER_COMMIT). Installing/upgrading Python deps..." >> $LOG_FILE 2>&1
+# Update Python dependencies only if requirements.txt changed (hash-based check)
+echo "=== DEPENDENCY UPDATE (hash-based) ===" >> $LOG_FILE 2>&1
+
+# Compute current hash of requirements files
+MAIN_REQS_HASH=$(md5sum requirements.txt 2>/dev/null | cut -d' ' -f1 || echo "none")
+SUB_REQS_HASH=$(md5sum Wan2GP/requirements.txt 2>/dev/null | cut -d' ' -f1 || echo "none")
+CURRENT_HASH="${{MAIN_REQS_HASH}}_${{SUB_REQS_HASH}}"
+
+# Load cached hash (stored in venv to persist across restarts)
+CACHED_HASH=$(cat venv/.requirements_hash 2>/dev/null || echo "")
+
+echo "Current requirements hash: $CURRENT_HASH" >> $LOG_FILE 2>&1
+echo "Cached requirements hash: $CACHED_HASH" >> $LOG_FILE 2>&1
+
+if [ "$CURRENT_HASH" != "$CACHED_HASH" ]; then
+    echo "Requirements changed! Installing/upgrading Python deps..." >> $LOG_FILE 2>&1
     python -m pip install --upgrade -r requirements.txt >> $LOG_FILE 2>&1 || echo "WARNING: pip install failed" >> $LOG_FILE 2>&1
+    
     # Also install subfolder requirements if present
     if [ -f Wan2GP/requirements.txt ]; then
         echo "Installing subfolder requirements from Wan2GP/requirements.txt" >> $LOG_FILE 2>&1
         python -m pip install --upgrade -r Wan2GP/requirements.txt >> $LOG_FILE 2>&1 || echo "WARNING: subfolder pip install failed" >> $LOG_FILE 2>&1
-    else
-        echo "No subfolder requirements found at Wan2GP/requirements.txt" >> $LOG_FILE 2>&1
     fi
+    
+    # Save new hash
+    echo "$CURRENT_HASH" > venv/.requirements_hash
+    echo "✅ Dependencies updated, hash saved" >> $LOG_FILE 2>&1
 else
-    echo "No repo updates detected or git pull failed; skipping pip install" >> $LOG_FILE 2>&1
+    echo "✅ Requirements unchanged, skipping pip install" >> $LOG_FILE 2>&1
+fi
+
+# Install all known missing packages from Headless-Wan2GP requirements.txt
+echo "=== INSTALLING CRITICAL PACKAGES ===" >> $LOG_FILE 2>&1
+python -m pip install --quiet \
+    mmgp==3.6.10 \
+    GitPython \
+    smplfitter \
+    s3tokenizer \
+    conformer \
+    >> $LOG_FILE 2>&1 || echo "WARNING: some critical package installs failed" >> $LOG_FILE 2>&1
+
+# Validate all critical imports before starting worker
+echo "=== VALIDATING IMPORTS ===" >> $LOG_FILE 2>&1
+python << 'VALIDATE_EOF' >> $LOG_FILE 2>&1
+import sys
+failed = []
+packages = [
+    ('mmgp', 'mmgp'),
+    ('mmgp.fp8_quanto_bridge', 'mmgp'),
+    ('git', 'GitPython'),
+    ('smplfitter', 'smplfitter'),
+    ('s3tokenizer', 's3tokenizer'),
+    ('conformer', 'conformer'),
+]
+for mod, pkg in packages:
+    try:
+        __import__(mod)
+        print(f"OK: {{mod}}")
+    except ImportError as e:
+        print(f"MISSING: {{mod}} (pip install {{pkg}})")
+        failed.append(pkg)
+
+if failed:
+    print(f"Missing packages: {{', '.join(failed)}}")
+    print("Attempting to install...")
+    import subprocess
+    subprocess.run([sys.executable, '-m', 'pip', 'install', '--quiet'] + list(set(failed)))
+    # Re-check
+    still_missing = []
+    for mod, pkg in packages:
+        try:
+            __import__(mod)
+        except ImportError:
+            still_missing.append(pkg)
+    if still_missing:
+        print(f"FATAL: Still missing after install: {{', '.join(still_missing)}}")
+        sys.exit(1)
+    print("All packages installed successfully on retry")
+else:
+    print("All critical imports validated")
+VALIDATE_EOF
+
+if [ $? -ne 0 ]; then
+    echo "❌ Import validation failed!" >> $LOG_FILE 2>&1
+    exit 1
 fi
 
 # Verify worker.py exists
 echo "=== CHECKING FILES ===" >> $LOG_FILE 2>&1
 ls -la worker.py >> $LOG_FILE 2>&1
 
-# Test Python import
-echo "=== TESTING PYTHON ===" >> $LOG_FILE 2>&1
-timeout 10 python -c "import sys; print('Python can start'); print('sys.path:', sys.path[:3])" >> $LOG_FILE 2>&1 || echo "Python import test failed" >> $LOG_FILE 2>&1
-
 # Final pre-flight checks before starting worker
 echo "=== PRE-FLIGHT CHECKS ===" >> $LOG_FILE 2>&1
-echo "✅ Checking virtual environment..." >> $LOG_FILE 2>&1
-echo "VIRTUAL_ENV: $VIRTUAL_ENV" >> $LOG_FILE 2>&1
-echo "Python path: $(which python)" >> $LOG_FILE 2>&1
-echo "Python version: $(python --version)" >> $LOG_FILE 2>&1
+echo "✅ Virtual env: $VIRTUAL_ENV" >> $LOG_FILE 2>&1
+echo "✅ Python: $(which python) ($(python --version 2>&1))" >> $LOG_FILE 2>&1
 
-echo "✅ Checking worker.py..." >> $LOG_FILE 2>&1
 if [ -f worker.py ]; then
-    echo "worker.py exists ($(wc -l < worker.py) lines)" >> $LOG_FILE 2>&1
+    echo "✅ worker.py exists ($(wc -l < worker.py) lines)" >> $LOG_FILE 2>&1
 else
     echo "❌ ERROR: worker.py not found!" >> $LOG_FILE 2>&1
     exit 1
 fi
-
-echo "✅ Testing Python imports..." >> $LOG_FILE 2>&1
-python -c "import sys, os; print('Python working, sys.path has', len(sys.path), 'entries')" >> $LOG_FILE 2>&1 || echo "❌ Python import test failed" >> $LOG_FILE 2>&1
 
 echo "✅ Checking environment variables..." >> $LOG_FILE 2>&1
 echo "WORKER_ID: $WORKER_ID" >> $LOG_FILE 2>&1
@@ -1081,8 +1170,10 @@ echo "SUPABASE_SERVICE_ROLE_KEY: ${{SUPABASE_SERVICE_ROLE_KEY:0:20}}..." >> $LOG
 
 # Start the actual worker process
 echo "=== STARTING MAIN WORKER ===" >> $LOG_FILE 2>&1
-WORKER_CMD="python worker.py --supabase-url $SUPABASE_URL --supabase-access-token $SUPABASE_SERVICE_ROLE_KEY --worker $WORKER_ID --debug"
+PRELOAD_FLAG="{'' if has_pending_tasks else '--preload-model wan_2_2_i2v_lightning_baseline_2_2_2'}"
+WORKER_CMD="python worker.py --supabase-url $SUPABASE_URL --supabase-access-token $SUPABASE_SERVICE_ROLE_KEY --worker $WORKER_ID --debug $PRELOAD_FLAG --wgp-profile 1"
 echo "Command: $WORKER_CMD" >> $LOG_FILE 2>&1
+echo "Preload model: {'NO (tasks pending)' if has_pending_tasks else 'YES (no tasks pending)'}" >> $LOG_FILE 2>&1
 echo "Starting at: $(date)" >> $LOG_FILE 2>&1
 
 # Start worker in background with comprehensive logging
@@ -1123,9 +1214,19 @@ echo "=========================================" >> $LOG_FILE 2>&1
         # Launch script in background so it doesn't block the orchestrator
         # The script will run for ~20 minutes installing dependencies
         launch_command = f"""
-        mkdir -p /workspace/Headless-Wan2GP/logs
+        WORKSPACE_DIR="/workspace"
+        PRIMARY_DIR="$WORKSPACE_DIR/Headless-Wan2GP"
+        FALLBACK_DIR="$WORKSPACE_DIR/Reigh-Worker"
+        if [ -d "$PRIMARY_DIR" ]; then
+            WORKDIR="$PRIMARY_DIR"
+        elif [ -d "$FALLBACK_DIR" ]; then
+            WORKDIR="$FALLBACK_DIR"
+        else
+            WORKDIR="$PRIMARY_DIR"
+        fi
+        mkdir -p "$WORKDIR/logs"
         chmod +x {script_path}
-        nohup {script_path} > /workspace/Headless-Wan2GP/logs/{worker_id}_startup.log 2>&1 &
+        nohup {script_path} > "$WORKDIR/logs/{worker_id}_startup.log" 2>&1 &
         echo $!
         """
         
@@ -1159,7 +1260,7 @@ echo "=========================================" >> $LOG_FILE 2>&1
         """
         try:
             # Check if worker is logging to Supabase (means worker.py started)
-            from database import DatabaseClient
+            from gpu_orchestrator.database import DatabaseClient
             db = DatabaseClient()
             
             logs = db.supabase.table('system_logs').select('id').eq('source_type', 'worker').eq('worker_id', worker_id).limit(1).execute()
@@ -1169,13 +1270,23 @@ echo "=========================================" >> $LOG_FILE 2>&1
                 logger.info(f"✅ Worker {worker_id} is now logging - retrieving startup logs")
                 
                 log_retrieval_command = f"""
-                if [ -f /workspace/Headless-Wan2GP/logs/gpu_{worker_id}.log ]; then
-                    echo "=== WORKER STARTUP LOG ==="
-                    tail -100 /workspace/Headless-Wan2GP/logs/gpu_{worker_id}.log
+                WORKSPACE_DIR="/workspace"
+                PRIMARY_DIR="$WORKSPACE_DIR/Headless-Wan2GP"
+                FALLBACK_DIR="$WORKSPACE_DIR/Reigh-Worker"
+                if [ -d "$PRIMARY_DIR" ]; then
+                    WORKDIR="$PRIMARY_DIR"
+                elif [ -d "$FALLBACK_DIR" ]; then
+                    WORKDIR="$FALLBACK_DIR"
+                else
+                    WORKDIR="$PRIMARY_DIR"
                 fi
-                if [ -f /workspace/Headless-Wan2GP/logs/{worker_id}_startup.log ]; then
+                if [ -f "$WORKDIR/logs/gpu_{worker_id}.log" ]; then
+                    echo "=== WORKER STARTUP LOG ==="
+                    tail -100 "$WORKDIR/logs/gpu_{worker_id}.log"
+                fi
+                if [ -f "$WORKDIR/logs/{worker_id}_startup.log" ]; then
                     echo "=== INITIALIZATION LOG ==="
-                    tail -200 /workspace/Headless-Wan2GP/logs/{worker_id}_startup.log
+                    tail -200 "$WORKDIR/logs/{worker_id}_startup.log"
                 fi
                 """
                 
@@ -1201,9 +1312,19 @@ echo "=========================================" >> $LOG_FILE 2>&1
                 echo "=== DISK SPACE ==="
                 df -h / /tmp /var 2>/dev/null | head -10
                 echo ""
-                if [ -f /workspace/Headless-Wan2GP/logs/{worker_id}_startup.log ]; then
+                WORKSPACE_DIR="/workspace"
+                PRIMARY_DIR="$WORKSPACE_DIR/Headless-Wan2GP"
+                FALLBACK_DIR="$WORKSPACE_DIR/Reigh-Worker"
+                if [ -d "$PRIMARY_DIR" ]; then
+                    WORKDIR="$PRIMARY_DIR"
+                elif [ -d "$FALLBACK_DIR" ]; then
+                    WORKDIR="$FALLBACK_DIR"
+                else
+                    WORKDIR="$PRIMARY_DIR"
+                fi
+                if [ -f "$WORKDIR/logs/{worker_id}_startup.log" ]; then
                     echo "=== STARTUP LOG ERRORS ==="
-                    tail -50 /workspace/Headless-Wan2GP/logs/{worker_id}_startup.log | grep -i "error\\|fail\\|exception\\|no space" || echo "No errors found in recent logs"
+                    tail -50 "$WORKDIR/logs/{worker_id}_startup.log" | grep -i "error\\|fail\\|exception\\|no space" || echo "No errors found in recent logs"
                 else
                     echo "=== STARTUP LOG ==="
                     echo "No startup log file yet"
