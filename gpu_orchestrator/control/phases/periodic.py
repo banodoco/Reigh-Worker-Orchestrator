@@ -275,6 +275,11 @@ class PeriodicChecksMixin:
             runpod.api_key = os.getenv("RUNPOD_API_KEY")
 
             pods = runpod.get_pods()
+            live_pods = [
+                pod
+                for pod in pods
+                if pod.get("desiredStatus") not in ["TERMINATED", "FAILED"]
+            ]
             gpu_worker_pods = [
                 pod
                 for pod in pods
@@ -303,8 +308,8 @@ class PeriodicChecksMixin:
                     except Exception as exc:
                         logger.error(f"ZOMBIE CLEANUP: Error terminating {runpod_id}: {exc}")
 
-            runpod_pod_ids = {pod.get("id") for pod in gpu_worker_pods}
-            runpod_pod_names = {pod.get("name") for pod in gpu_worker_pods}
+            runpod_pod_ids = {pod.get("id") for pod in live_pods}
+            runpod_pod_names = {pod.get("name") for pod in live_pods}
 
             for worker in db_workers:
                 if worker["status"] in ["active", "spawning"]:
