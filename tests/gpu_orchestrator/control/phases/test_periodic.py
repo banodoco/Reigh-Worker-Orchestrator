@@ -155,3 +155,47 @@ def test_zombie_check_does_not_mark_live_test_pod_missing_when_non_gpu_named_pod
     host._mark_worker_error.assert_not_awaited()
     host.runpod.terminate_worker.assert_not_called()
     assert summary["actions"] == {"workers_failed": 0, "workers_terminated": 0}
+
+
+def test_zombie_check_skips_live_test_worker_missing_from_provider_listing(monkeypatch):
+    live_test_worker = {
+        "id": "pod-live",
+        "status": "active",
+        "metadata": {"runpod_id": "pod-live", "live_test_variant": "prebuilt"},
+    }
+    production_worker = {
+        "id": "gpu-prod",
+        "status": "active",
+        "metadata": {"runpod_id": "pod-prod"},
+    }
+
+    class Host(periodic.PeriodicChecksMixin):
+        def __init__(self):
+            self.db = SimpleNamespace(
+                get_workers=AsyncMock(return_value=[live_test_worker, production_worker]),
+            )
+            self.runpod = Mock()
+            self.runpod.terminate_worker = Mock(return_value=True)
+            self._mark_worker_error = AsyncMock()
+            self.cycle_count = 10
+
+    monkeypatch.setattr(
+        periodic.runpod,
+        "get_pods",
+        lambda: [
+            {
+                "id": "pod-prod",
+                "name": "gpu-prod",
+                "desiredStatus": "RUNNING",
+            }
+        ],
+    )
+
+    host = Host()
+    summary = {"actions": {"workers_failed": 0, "workers_terminated": 0}}
+
+    asyncio.run(host._efficient_zombie_check(summary))
+
+    host._mark_worker_error.assert_not_awaited()
+    host.runpod.terminate_worker.assert_not_called()
+    assert summary["actions"] == {"workers_failed": 0, "workers_terminated": 0}

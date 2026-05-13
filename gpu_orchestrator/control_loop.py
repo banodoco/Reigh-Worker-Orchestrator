@@ -1760,6 +1760,8 @@ class OrchestratorControlLoop:
 
             for worker in db_workers:
                 if worker['status'] in ['active', 'spawning']:
+                    if is_excluded_from_capacity_control(worker):
+                        continue
                     runpod_id = worker.get('metadata', {}).get('runpod_id')
                     worker_id = worker['id']
 
