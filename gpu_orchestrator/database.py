@@ -690,13 +690,29 @@ class DatabaseClient:
             # Orchestrator tasks get a longer timeout (2 hours) since they
             # coordinate multi-step pipelines, but they're not exempt — a stuck
             # orchestrator blocks the queue just like any other task.
+            #
+            # Long-running individual generation types (VACE / Wan22 segments,
+            # animate_character) also need the 2h window: their inference runs
+            # 20–60 minutes on a single GPU and the worker doesn't poke
+            # tasks.updated_at during inference, so the default 30m cap
+            # incorrectly classifies them as stalled.
             orchestrator_cutoff = datetime.now(timezone.utc) - timedelta(hours=2)
+            long_running_task_types = {
+                'travel_segment',
+                'individual_travel_segment',
+                'join_clips_segment',
+                'animate_character',
+                'video_enhance',
+                'edit_video',
+            }
 
             task_ids = []
             for task in result.data:
-                is_orchestrator = '_orchestrator' in task.get('task_type', '').lower()
-                if is_orchestrator:
-                    # Check against the longer orchestrator cutoff
+                task_type = task.get('task_type', '').lower()
+                is_orchestrator = '_orchestrator' in task_type
+                is_long_running = task_type in long_running_task_types
+                if is_orchestrator or is_long_running:
+                    # Check against the longer 2-hour cutoff
                     task_updated = task.get('updated_at', '')
                     if task_updated and task_updated < orchestrator_cutoff.isoformat():
                         task_ids.append(task['id'])
