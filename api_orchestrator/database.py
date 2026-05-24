@@ -42,6 +42,22 @@ class DatabaseClient:
             logger.error(f"Failed to register API worker {worker_id}: {e}")
             return False
 
+    def update_heartbeat(self, worker_id: str) -> bool:
+        """Refresh only last_heartbeat for an already-registered API worker.
+
+        register_worker() is called once at startup, so without this the
+        api worker's last_heartbeat goes stale and health monitors (e.g. the
+        route-contract sentinel) mis-classify it as a stuck/dead worker.
+        """
+        try:
+            self.supabase.table('workers').update({
+                'last_heartbeat': datetime.now(timezone.utc).isoformat(),
+            }).eq('id', worker_id).execute()
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to update heartbeat for {worker_id}: {e}")
+            return False
+
     def reset_orphaned_tasks(self, worker_id: str) -> int:
         """Reset any tasks stuck 'In Progress' on this worker.
 

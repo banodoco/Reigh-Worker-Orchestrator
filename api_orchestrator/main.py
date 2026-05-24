@@ -225,6 +225,11 @@ async def main_async() -> None:
         while True:
             loop_count += 1
 
+            # Keep last_heartbeat fresh so health monitors don't mis-classify
+            # this API worker as stuck/dead (register_worker only runs at startup).
+            if db_client and loop_count % 3 == 1:
+                db_client.update_heartbeat(worker_id)
+
             # prune finished subtasks
             done = {t for t in active_tasks if t.done()}
             if done:
