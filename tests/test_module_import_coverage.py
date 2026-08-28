@@ -72,7 +72,6 @@ def test_runpod_cutover_modules_import_at_runtime() -> None:
         "scripts.ssh_to_worker",
         "scripts.terminate_single_worker",
         "scripts.test_runpod",
-        "scripts.spot_instance_lifetime_test",
     ]
 
     for module_name in module_names:
