@@ -676,7 +676,7 @@ class DatabaseClient:
             # - In Progress with a worker assigned (not api-worker-*, those are handled separately)
             # - Haven't been updated in timeout_minutes
             # - Have attempts < 3 (allow retry)
-            result = self.supabase.table('tasks').select('id, task_type, worker_id') \
+            result = self.supabase.table('tasks').select('id, task_type, worker_id, updated_at') \
                 .eq('status', 'In Progress') \
                 .not_.is_('worker_id', 'null') \
                 .not_.like('worker_id', 'api-worker-%') \
