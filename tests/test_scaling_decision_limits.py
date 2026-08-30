@@ -56,6 +56,19 @@ class TestMinimumWorkers:
 class TestMaxCapacity:
     """Tests for max capacity enforcement."""
 
+    def test_zero_max_is_a_hard_off_switch(self):
+        config = make_config(min_active_gpus=0, max_active_gpus=0, machines_to_keep_idle=0)
+        worker_states = [
+            make_worker_state("active-1", WorkerLifecycle.ACTIVE_READY, has_active_task=False),
+        ]
+        task_counts = TaskCounts(queued=5, active_cloud=0, total=5)
+
+        decision = calculate_scaling_decision_pure(worker_states, task_counts, config, failure_rate_ok=True)
+
+        assert decision.desired_workers == 0
+        assert decision.workers_to_spawn == 0
+        assert decision.workers_to_terminate == 1
+
     def test_max_capacity_limits_spawning(self):
         config = make_config(min_active_gpus=0, max_active_gpus=2, machines_to_keep_idle=0)
         worker_states = [

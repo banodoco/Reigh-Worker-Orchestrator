@@ -976,11 +976,25 @@ class OrchestratorControlLoop:
             terminatable.sort(key=lambda w: w.get('created_at', ''), reverse=True)
 
             # Calculate how many to terminate
-            max_by_buffer = max(0, decision.idle_count - max(config.machines_to_keep_idle, 1))
+            # The normal policy keeps at least one idle worker, but MAX_ACTIVE_GPUS=0
+            # is an explicit emergency/off switch and must override that floor.
+            idle_reserve = min(max(config.machines_to_keep_idle, 1), config.max_active_gpus)
+            max_by_buffer = max(0, decision.idle_count - idle_reserve)
             max_by_capacity = decision.workers_to_terminate
             max_by_min_active = max(0, decision.active_count - config.min_active_gpus)
 
             to_terminate = min(len(terminatable), max_by_buffer, max_by_capacity, max_by_min_active)
+
+            logger.info(
+                "SCALE_DOWN_EVALUATION: eligible=%s idle_reserve=%s "
+                "by_buffer=%s by_capacity=%s by_min=%s selected=%s",
+                len(terminatable),
+                idle_reserve,
+                max_by_buffer,
+                max_by_capacity,
+                max_by_min_active,
+                to_terminate,
+            )
 
             if to_terminate > 0:
                 logger.info(f"Terminating {to_terminate} workers (over-capacity: {decision.current_capacity} > {decision.desired_workers})")
