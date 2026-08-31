@@ -1,0 +1,120 @@
+{
+  "checks": [
+    {
+      "id": "issue_hints",
+      "question": "Did the work fully address the issue hints, user notes, and approved plan requirements?",
+      "findings": [
+        {
+          "detail": "Checked `gpu_orchestrator/control_loop.py` cycle ordering: `run_cycle()` currently calls `_handle_early_termination()` before `_handle_spawning_workers()` at lines 115-119, while the brief requires shadow observation after lifecycle probing and before legacy capacity actions. The plan correctly notices this conflict as an open question, but leaves it unresolved; an executor could either reorder lifecycle probing in Phase A or keep the current order and contaminate the shadow audit.",
+          "flagged": true
+        },
+        {
+          "detail": "Checked the deletion acceptance criteria against the rollout plan. The brief's deliverables require `_handle_early_termination` and `gpu_orchestrator/control/phases/` to be gone in the shipped final state, while the plan's execution order intentionally keeps legacy behavior through shadow and only deletes in a later cleanup slice; that staged rollout is probably operationally sensible, but it is a divergence that needs an explicit gate definition for which slice is being reviewed.",
+          "flagged": true
+        }
+      ]
+    },
+    {
+      "id": "correctness",
+      "question": "Are the proposed changes technically correct?",
+      "findings": [
+        {
+          "detail": "Checked route-aware task metadata in `gpu_orchestrator/database.py` and tests such as `tests/gpu_orchestrator/test_route_aware_task_counts.py`: the selected totals already retain `route_keys`, and `DerivedWorkerState` carries `worker_pool` and route contract fields. The plan assumes `route_key` can stay nullable and pool-wide for the current controller, but invariant 5 requires RunPod spawn backoff keyed by `(pool, route_key)`; using only a pool-wide key can suppress unrelated routes after a failure on one route and weakens the required per-route audit trail.",
+          "flagged": true
+        },
+        {
+          "detail": "Checked `worker_state.py` route-stale logic and existing scaling tests: route-stale workers are excluded from fresh-route capacity, but the current selected task counts may aggregate multiple compatible `route_keys` into one pool total. The plan does not specify how `Observed.route_key` is chosen when `selected_pool_totals.route_keys` contains more than one key, so the reconciler could write one intent row with a null or arbitrary route key while making decisions from aggregated demand.",
+          "flagged": true
+        }
+      ]
+    },
+    {
+      "id": "scope",
+      "question": "Search for related code that handles the same concept. Is the reported issue a symptom of something broader?",
+      "findings": [
+        {
+          "detail": "Checked the capacity-control boundary in `gpu_orchestrator/live_test_workers.py`, `gpu_orchestrator/control_loop.py`, and `gpu_orchestrator/control/phases/state.py`: the current production loop partitions workers with `excluded_from_capacity_control` before deriving capacity state, while periodic cleanup still sees excluded workers. The plan's `Observed`/`observe()` requirements mention active, spawning, route-stale, and idle counts, but not excluded live-test workers; without carrying this rule forward, the reconciler could count or terminate harness-owned workers that the current controller deliberately excludes from production capacity math.",
+          "flagged": true
+        },
+        {
+          "detail": "Checked related capacity paths with `rg`: besides production `control_loop.py`, the repo has duplicated scaling/worker capacity mixins under `gpu_orchestrator/control/phases/` and direct tests of `calculate_scaling_decision_pure()` in `tests/test_scaling_decision_*`. The plan covers deleting the mixin tree and rewriting its tests, and it preserves direct worker-state tests as validation of existing pure logic; this scope appears aligned with the brief's production-vs-test-path distinction.",
+          "flagged": false
+        }
+      ]
+    },
+    {
+      "id": "all_locations",
+      "question": "Does the change touch all locations AND supporting infrastructure?",
+      "findings": [
+        {
+          "detail": "Checked migration infrastructure: `scripts/apply_sql_migrations.py` and `scripts/show_migrations.py` use hardcoded migration filename lists, and `railway.json` starts from `api_orchestrator/Dockerfile` without a migration step. The plan includes registration in those scripts and notes Railway does not apply SQL at boot, so it correctly identifies the main glue work, but the deployment path remains manual unless a separate operational step is added.",
+          "flagged": true
+        },
+        {
+          "detail": "Checked `system_logs` schema in `sql/20250115000000_create_system_logs.sql`: the `valid_source_type` constraint allows only `orchestrator_gpu`, `orchestrator_api`, and `worker`. The plan follows the brief by using `orchestrator_gpu` with root metadata tags for shadow intent logs, so no extra source-type migration is needed.",
+          "flagged": false
+        }
+      ]
+    },
+    {
+      "id": "callers",
+      "question": "Find the callers of the changed function. What arguments do they actually pass? Does the fix handle all of them?",
+      "findings": [
+        {
+          "detail": "Checked the spawn call path in `control_loop.py`: `_execute_scaling()` increments `CycleSummary.workers_spawned` only after `_spawn_worker(queued_count=task_counts.queued)` returns true, and `_spawn_worker()` creates a worker row before calling RunPod then enriches metadata after the RunPod response. The plan's new record-before-act/idempotency path must either extend this helper signature or replace its caller, because the current `DatabaseClient.create_worker_record()` only accepts `worker_id`, `instance_type`, and optional `runpod_id`, not `capacity_intent_id` or action ordinal metadata at initial insert time.",
+          "flagged": true
+        },
+        {
+          "detail": "Checked termination callers: early termination updates the worker row even if `runpod.terminate_worker()` returns false, while `_terminate_worker()` returns false and skips the DB status update on RunPod termination failure. The plan says to reuse `_terminate_worker()` semantics for authoritative `TerminateIdle` and `CancelPendingSpawn`, but canceling a pending spawn is closer to the early-termination resilience pattern; otherwise a transient RunPod API failure can leave a spawn counted as live and eligible for repeated cancel attempts.",
+          "flagged": true
+        }
+      ]
+    }
+  ],
+  "flags": [
+    {
+      "id": "FLAG-001",
+      "concern": "Route-key semantics: the plan treats `route_key` as nullable/pool-wide even though the existing task-count path can report one or more selected `route_keys` and the brief requires backoff by `(pool, route_key)`. This can over-suppress spawning for unrelated routes and makes per-route intent audit ambiguous.",
+      "category": "correctness",
+      "severity_hint": "likely-significant",
+      "evidence": "`gpu_orchestrator/database.py` builds `selected_pool_totals.route_keys`; `tests/gpu_orchestrator/test_route_aware_task_counts.py` asserts route keys are retained; plan assumption 2 says `route_key` is nullable and pool-wide."
+    },
+    {
+      "id": "FLAG-002",
+      "concern": "Capacity exclusion: the new `observe()` requirements omit the existing `excluded_from_capacity_control` partition, so live-test or harness-owned workers could be counted or mutated by production capacity reconciliation.",
+      "category": "completeness",
+      "severity_hint": "likely-significant",
+      "evidence": "`gpu_orchestrator/control_loop.py` fetches workers then calls `partition_capacity_workers()` before production capacity phases; `gpu_orchestrator/live_test_workers.py` documents that excluded workers bypass capacity math but still get cleanup."
+    },
+    {
+      "id": "FLAG-003",
+      "concern": "Cutover staging ambiguity: the plan both accepts final deletion requirements and proposes staged shadow/cutover/cleanup slices, but does not define which acceptance gates apply to each PR or deployable unit.",
+      "category": "completeness",
+      "severity_hint": "uncertain",
+      "evidence": "Deliverables require `_handle_early_termination` grep-zero and `control/phases/` removal; execution order keeps legacy behavior during shadow and deletes in a later cleanup slice."
+    },
+    {
+      "id": "verifiability-0",
+      "concern": "Criterion 19: requires human verification (subjective_judgment).",
+      "category": "verifiability",
+      "severity_hint": "likely-minor",
+      "status": "open"
+    },
+    {
+      "id": "verifiability-1",
+      "concern": "Criterion 20: requires human verification (subjective_judgment).",
+      "category": "verifiability",
+      "severity_hint": "likely-minor",
+      "status": "open"
+    },
+    {
+      "id": "verifiability-2",
+      "concern": "Criterion 21: requires human verification (observe_runtime_logs).",
+      "category": "verifiability",
+      "severity_hint": "likely-minor",
+      "status": "open"
+    }
+  ],
+  "verified_flag_ids": [],
+  "disputed_flag_ids": []
+}

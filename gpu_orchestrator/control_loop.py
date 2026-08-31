@@ -34,6 +34,11 @@ from .live_test_workers import (
 )
 from .logging_config import set_current_worker
 from .worker_spawner import create_worker_spawner
+from .control.capacity_actions import (
+    CapacityActionExecutor,
+    apply_reconciliation_counters_to_summary,
+)
+from .control.capacity_reconciler import CapacityReconciler
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +67,10 @@ class OrchestratorControlLoop:
 
         # Log configuration at startup
         logger.info(f"OrchestratorControlLoop initialized with scaling: {self.config.min_active_gpus}-{self.config.max_active_gpus} GPUs, idle buffer: {self.config.machines_to_keep_idle}")
+        logger.info(
+            "Capacity reconciler mode: %s",
+            self.config.capacity_reconciler_mode,
+        )
         self.config.log_config()
 
         # Log SSH configuration
@@ -81,6 +90,31 @@ class OrchestratorControlLoop:
             logger.info("Using SSH material from environment variable")
         else:
             logger.info("Using SSH material from configured file path")
+
+    async def _run_capacity_reconciler(self, mode: str, summary: CycleSummary) -> None:
+        """Run the capacity reconciler and fold authoritative counters into the cycle summary."""
+
+        executor = CapacityActionExecutor(
+            db=self.db,
+            runpod=self.runpod,
+            config=self.config,
+        )
+        reconciler = CapacityReconciler(
+            db=self.db,
+            config=self.config,
+            mode=mode,
+            action_executor=executor,
+        )
+        result = await reconciler.reconcile(self.cycle_count, mode=mode)
+        if mode == "authoritative":
+            apply_reconciliation_counters_to_summary(summary, result.counters)
+
+        logger.info(
+            "Capacity reconciler cycle complete: mode=%s intent_id=%s counters=%s",
+            mode,
+            result.intent_id,
+            result.counters,
+        )
 
     # =========================================================================
     # MAIN CYCLE: Coordinates all phases
@@ -106,32 +140,67 @@ class OrchestratorControlLoop:
         summary = CycleSummary()
 
         try:
-            # Phase 1: Fetch current state
-            workers, excluded_workers, task_counts, detailed_counts = await self._fetch_current_state()
+            mode = self.config.capacity_reconciler_mode
 
-            # Phase 2: Derive state for all workers
-            worker_states = await self._derive_all_worker_states(workers, task_counts.queued)
+            if mode == "off":
+                # Phase 1: Fetch current state
+                workers, excluded_workers, task_counts, detailed_counts = await self._fetch_current_state()
 
-            # Phase 3: Handle early termination of over-capacity spawning workers
-            worker_states = await self._handle_early_termination(worker_states, task_counts, summary)
+                # Phase 2: Derive state for all workers
+                worker_states = await self._derive_all_worker_states(workers, task_counts.queued)
 
-            # Phase 4: Handle spawning workers (pod init, script launch, promotion)
-            await self._handle_spawning_workers(worker_states, task_counts, summary)
+                # Phase 3: Handle early termination of over-capacity spawning workers
+                worker_states = await self._handle_early_termination(worker_states, task_counts, summary)
 
-            # Phase 5: Health check active workers
-            await self._health_check_active_workers(worker_states, task_counts, summary)
+                # Phase 4: Handle spawning workers (pod init, script launch, promotion)
+                await self._handle_spawning_workers(worker_states, task_counts, summary)
 
-            # Phase 6: Cleanup error workers
-            await self._cleanup_error_workers(worker_states, summary)
+                # Phase 5: Health check active workers
+                await self._health_check_active_workers(worker_states, task_counts, summary)
 
-            # Phase 7: Reconcile orphaned tasks
-            await self._reconcile_orphaned_tasks(worker_states, summary)
+                # Phase 6: Cleanup error workers
+                await self._cleanup_error_workers(worker_states, summary)
 
-            # Phase 8: Calculate scaling decision
-            scaling = await self._calculate_scaling_decision(worker_states, task_counts)
+                # Phase 7: Reconcile orphaned tasks
+                await self._reconcile_orphaned_tasks(worker_states, summary)
 
-            # Phase 9: Execute scaling
-            await self._execute_scaling(scaling, worker_states, task_counts, summary, detailed_counts)
+                # Phase 8: Calculate scaling decision
+                scaling = await self._calculate_scaling_decision(worker_states, task_counts)
+
+                # Phase 9: Execute scaling
+                await self._execute_scaling(scaling, worker_states, task_counts, summary, detailed_counts)
+            else:
+                # Phase 1: Fetch current state
+                workers, excluded_workers, task_counts, detailed_counts = await self._fetch_current_state()
+
+                # Phase 2: Derive state for lifecycle and cleanup paths
+                worker_states = await self._derive_all_worker_states(workers, task_counts.queued)
+
+                # Phase 3: Lifecycle probing first. Shadow observations are
+                # captured after this, before any legacy capacity mutations.
+                await self._handle_spawning_workers(worker_states, task_counts, summary)
+                await self._health_check_active_workers(worker_states, task_counts, summary)
+                await self._cleanup_error_workers(worker_states, summary)
+                await self._reconcile_orphaned_tasks(worker_states, summary)
+                await self._handle_stale_route_workers(worker_states, summary)
+
+                # Phase 4: Shadow or authoritative capacity reconciliation.
+                await self._run_capacity_reconciler(mode, summary)
+
+                if mode == "shadow":
+                    # Phase 5: Legacy capacity controller remains authoritative
+                    # during shadow mode, using its own post-lifecycle snapshot.
+                    workers, excluded_workers, task_counts, detailed_counts = await self._fetch_current_state()
+                    worker_states = await self._derive_all_worker_states(workers, task_counts.queued)
+                    worker_states = await self._handle_early_termination(worker_states, task_counts, summary)
+                    scaling = await self._calculate_scaling_decision(worker_states, task_counts)
+                    await self._execute_scaling(scaling, worker_states, task_counts, summary, detailed_counts)
+                elif mode == "authoritative":
+                    logger.debug(
+                        "Skipping legacy capacity actions in authoritative capacity reconciler mode"
+                    )
+                else:
+                    raise ValueError(f"Unsupported capacity reconciler mode: {mode}")
 
             # Phase 10: Periodic checks (storage, zombies). Cleanup paths
             # also see excluded workers so harness crashes can't leak GPUs.

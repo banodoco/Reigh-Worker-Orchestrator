@@ -1,0 +1,81 @@
+{
+  "output": "Batch 9 complete. T8 added operator audit SQL and scaling-audit capacity reconciler reporting. T10 added focused runtime-safety tests for reconciler invariants.",
+  "files_changed": [
+    "scripts/capacity_reconciler_audit.sql",
+    "tests/control/test_capacity_reconciler.py",
+    "/Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug.py",
+    "/Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug/commands/scaling_audit.py",
+    ".megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_9.json"
+  ],
+  "commands_run": [
+    "python -m pytest tests/control/test_capacity_reconciler.py -q",
+    "python -m py_compile /Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug.py /Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug/commands/scaling_audit.py",
+    "python /Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug.py --help >/tmp/debug_help.out && rg -n 'capacity intents|scaling-audit|worker churn' /tmp/debug_help.out",
+    "rg -n \"worker_capacity_intents|worker_capacity_route_backoffs|orchestrator_leases|shadow_intended_action|route_demand_fallback|lease_suppressed|authoritative\" scripts/capacity_reconciler_audit.sql /Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug/commands/scaling_audit.py",
+    "python -m pytest tests/control/test_capacity_reconciler.py tests/gpu_orchestrator/control -q",
+    "python -m pytest tests/gpu_orchestrator/test_control_loop_capacity_reconciler_mode.py tests/gpu_orchestrator/test_config_route_contract.py tests/gpu_orchestrator/test_database_capacity_helpers.py tests/scripts/test_sql_migrations.py -q",
+    "python -m pytest tests/test_scaling_decision_spawn.py tests/test_scaling_decision_limits.py tests/test_route_stale_worker_state.py tests/gpu_orchestrator/test_route_aware_task_counts.py -q",
+    "python -m pytest --tb=no -q --no-header",
+    "jq -e . .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_9.json >/dev/null"
+  ],
+  "deviations": [
+    "Full suite still fails only at `tests/test_module_import_coverage.py::test_runpod_cutover_modules_import_at_runtime` because `scripts.spot_instance_lifetime_test` is missing. This was already observed in prior batches and is unrelated to T8/T10.",
+    "Advisory observation mismatch: executor claimed files not observed in git status/content hash delta: .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_9.json, /Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug.py, /Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug/commands/scaling_audit.py, tests/control/test_capacity_reconciler.py",
+    "Advisory observation mismatch: git status/content hash delta found unclaimed files: tests/control/",
+    "Advisory audit finding: Executor claimed changed files not present in git status: /Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug.py, /Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug/commands/scaling_audit.py",
+    "Advisory audit finding: Git status shows changed files not claimed by any task: .megaplan/debt.json, .megaplan/plans/capacity-reconciler-20260513/, .megaplan/schemas/feedback.json, .megaplan/schemas/finalize.json, .megaplan/schemas/review.json, .megaplan/schemas/revise.json",
+    "Advisory audit finding: Sense check SC9 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC11 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC12 is missing an executor acknowledgment.",
+    "Advisory audit finding: Tasks left pending after execute (executor never started them): T9, T11, T12"
+  ],
+  "task_updates": [
+    {
+      "task_id": "T8",
+      "status": "done",
+      "executor_notes": "Added `scripts/capacity_reconciler_audit.sql` with operator queries for shadow intended actions, pool summary intents, shadow observer dedupe, authoritative one-row-per-pool-cycle invariant, route backoff windows, shadow-vs-legacy worker mutation comparison, and current leases. Extended `/Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug.py` help text for capacity-intent auditing. Extended `/Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug/commands/scaling_audit.py` to query `worker_capacity_intents`, `worker_capacity_route_backoffs`, and `orchestrator_leases`; report pool intent stability, shadow observer duplicate observations, authoritative duplicate cycles, route backoff windows, route-demand fallback rows, lease suppressions, latest adoption intents, divergence counts, and legacy worker mutation counts alongside existing churn/effective-utilization output. JSON output now includes a `capacity_reconciler` section. Verification: app debug files compile, `debug.py --help` advertises capacity intents, and rg verified the committed SQL/debug surfaces reference the required tables and metadata fields.",
+      "files_changed": [
+        "scripts/capacity_reconciler_audit.sql",
+        "/Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug.py",
+        "/Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug/commands/scaling_audit.py",
+        ".megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_9.json"
+      ],
+      "commands_run": [
+        "python -m py_compile /Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug.py /Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug/commands/scaling_audit.py",
+        "python /Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug.py --help >/tmp/debug_help.out && rg -n 'capacity intents|scaling-audit|worker churn' /tmp/debug_help.out",
+        "rg -n \"worker_capacity_intents|worker_capacity_route_backoffs|orchestrator_leases|shadow_intended_action|route_demand_fallback|lease_suppressed|authoritative\" scripts/capacity_reconciler_audit.sql /Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug/commands/scaling_audit.py",
+        "python -m pytest --tb=no -q --no-header",
+        "jq -e . .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_9.json >/dev/null"
+      ],
+      "auto_attributed_files": false
+    },
+    {
+      "task_id": "T10",
+      "status": "done",
+      "executor_notes": "Added `tests/control/test_capacity_reconciler.py` as a focused runtime-safety suite covering queued-zero incident replay/no cancel, route-scoped backoff exact 30/60/120/240 second delays plus reset on successful spawn, pool-floor sentinel uniqueness for nullable route keys, pool bounds applied once across multiple routes, wall-clock and `valid_until` cancel hysteresis, route-stale and excluded-worker effective-capacity exclusion, authoritative lease/record-before-act/exact-one-row/adoption behavior, lease rejection suppression, shadow no-side-effects with observer/observation dedupe identifiers, spawn idempotency, CycleSummary counter folding, and cancel terminal marking despite failed RunPod termination. Verification passed for `tests/control/test_capacity_reconciler.py`, full `tests/gpu_orchestrator/control`, control-loop/config/database/migration targeted suites, and scaling/route-stale/route-aware targeted suites. Full suite was run and failed only at the already observed missing `scripts.spot_instance_lifetime_test` import, unrelated to T10.",
+      "files_changed": [
+        "tests/control/test_capacity_reconciler.py",
+        ".megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_9.json"
+      ],
+      "commands_run": [
+        "python -m pytest tests/control/test_capacity_reconciler.py -q",
+        "python -m pytest tests/control/test_capacity_reconciler.py tests/gpu_orchestrator/control -q",
+        "python -m pytest tests/gpu_orchestrator/test_control_loop_capacity_reconciler_mode.py tests/gpu_orchestrator/test_config_route_contract.py tests/gpu_orchestrator/test_database_capacity_helpers.py tests/scripts/test_sql_migrations.py -q",
+        "python -m pytest tests/test_scaling_decision_spawn.py tests/test_scaling_decision_limits.py tests/test_route_stale_worker_state.py tests/gpu_orchestrator/test_route_aware_task_counts.py -q",
+        "python -m pytest --tb=no -q --no-header",
+        "jq -e . .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_9.json >/dev/null"
+      ],
+      "auto_attributed_files": false
+    }
+  ],
+  "sense_check_acknowledgments": [
+    {
+      "sense_check_id": "SC8",
+      "executor_note": "Yes. Operators can inspect shadow-vs-legacy divergence and legacy worker mutation counts, authoritative pool intent stability, shadow observer dedupe, route backoff windows, route-demand fallback rows, lease suppressions, latest adoption intents, and existing churn/effective-utilization through the committed SQL and the extended `scaling-audit` command."
+    },
+    {
+      "sense_check_id": "SC10",
+      "executor_note": "Yes. The new focused test module covers queued-zero no-cancel replay, route-scoped backoff with exact cooldowns and reset, pool-floor sentinel uniqueness, pool-budget bounds applied once, single-writer lease behavior, adoption, excluded/route-stale workers, idempotency, shadow no-side-effects, record-before-act ordering, cancel terminal marking despite RunPod termination failure, shadow observer dedupe identifiers, and CycleSummary counters."
+    }
+  ]
+}

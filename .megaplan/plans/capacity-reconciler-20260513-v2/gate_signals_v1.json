@@ -1,0 +1,399 @@
+{
+  "robustness": "standard",
+  "signals": {
+    "iteration": 1,
+    "idea": "# brief-unify-capacity-control-20260513\n\n**Profile:** `all-codex/standard/high`\n**Repo:** `reigh-worker-orchestrator` (Python, Railway-deployed) + small cross-repo touch in `reigh-app/scripts/debug.py`\n**Branch base:** `origin/main` at `fcec14f`\n**Rollout:** shadow-mode \u2192 divergence audit \u2192 flag-flip cutover\n\n> **Brief revision history:** drafted 2026-05-13. Sense-checked by Codex GPT-5.5 `high` (read-only, repo-aware). Corrections from that review folded in below \u2014 most importantly: code-level claims about `calculate_scaling_decision_pure` and the cycle phase order have been corrected against ground truth.\n\n---\n\n## Goal\n\nReplace the orchestrator's two-controller scaling loop with one durable-intent reconciler. Specifically:\n\n1. Introduce `worker_capacity_intents` (Postgres) as the durable source of truth for \"what capacity should exist right now, for what reason, with what cooldowns.\"\n2. Build `gpu_orchestrator/control/capacity_reconciler.py` with an explicit five-phase state machine: **OBSERVE \u2192 PLAN \u2192 ADMIT \u2192 ACT \u2192 RECORD**.\n3. Delete `_handle_early_termination` entirely. Its job becomes a `cancel_pending_spawn` action emitted by the reconciler under strictly-defined conditions.\n4. Fold RunPod `spawn_failed` backoff into the same reconciler as admission control (no separate guardrail path).\n5. Delete the test-only duplicate code path under `gpu_orchestrator/control/phases/` (which is *not* the production runtime path \u2014 see \"Context\" below).\n6. Roll out via shadow mode: new reconciler runs alongside the existing controller, logs intended actions, doesn't take effect until a feature flag flips.\n\nSuccess is measured by **production effective-utilisation rising from ~4% to \u226570%** sustained over 24h post-cutover, with no user-task failures attributable to the new controller.\n\n---\n\n## Context \u2014 what's broken\n\nA 2-hour rollout window on 2026-05-13 observed **73 GPU workers spawned, 70 killed before becoming productive, 1 worker did all the actual work** (4% effective utilisation). The same pattern is present in git history going back at least 6 weeks.\n\nTwo parallel Codex GPT-5.5 sense-checks (independent runs, no cross-talk) reading `gpu_orchestrator/control_loop.py` converged on a single architectural diagnosis, **subsequently verified by a third Codex `high` review** against the actual code:\n\n> The orchestrator runs **two independent capacity controllers** in one cycle. `_handle_early_termination` (around `control_loop.py:340`, `current_capacity` derived at `:362`, gate check at `:377`) computes one `desired` figure from `task_counts.total * scale_down_multiplier` + min GPUs + idle buffer. Later in the same cycle, `_calculate_scaling_decision` calls `calculate_scaling_decision_pure` at `control_loop.py:802` (when `use_new_scaling_logic` is enabled), which emits spawn action math from queued coverage (`workers_covering_tasks = idle + spawning`, `uncovered_tasks = queued - workers_covering_tasks`, `spawn_for_tasks = uncovered_tasks`, see `worker_state.py:588`) plus a busy-worker buffer floor (`worker_state.py:594`). **However**, `desired_workers` itself is still populated from the legacy `total_workload * scale_up_multiplier`, `busy + idle buffer`, and `min_active_gpus` block at `worker_state.py:616`.\n>\n> The bug is **not** \"stale snapshot between phases\" \u2014 the scaling decision is computed *after* early-term, not before. The bug is that early-term **mutates the worker list** (terminating spawning workers) before a second, separate scaling formula runs against the same phase-1 task snapshot and the now-changed worker list. Two formulas, two notions of `desired`, one cycle, opposing actions.\n\nThree named failure modes ride on this defect:\n\n- **Spawn churn from snapshot gates.** `_handle_early_termination` is guarded by `if task_counts.queued > 0` (at `control_loop.py:377`). `task_counts.queued` is an instantaneous snapshot taken once at the top of each cycle. When the single productive worker had just claimed a segment (queue momentarily empty, six in-progress segments active), early-term fired and killed the spawning replacement. Next cycle re-spawned. Loop.\n- **No backoff for RunPod `spawn_failed`.** 55 of the 73 deaths were RunPod refusing pod allocation. The orchestrator retried at 30-second cycle cadence indefinitely.\n- **Mutating actions sequenced before mismatched re-derivation.** Early-term terminates spawning workers from the worker list, then `_calculate_scaling_decision` re-derives `desired` against the same phase-1 task snapshot but a now-shorter worker list, and decides to re-spawn what early-term just killed.\n\nA team-authored postmortem (`/Users/peteromalley/Documents/reigh-workspace/docs/scaling-churn-postmortem-20260513.md`) and approach memo (`/Users/peteromalley/Documents/reigh-workspace/docs/scaling-churn-approach-20260513.md`) cover the symptom-level analysis. The architectural prescription below is the *deep* fix.\n\n### Duplicate code path \u2014 clarified\n\n`gpu_orchestrator/control_loop.py` is **the** production runtime path. `main.py` imports `OrchestratorControlLoop` from it. The `gpu_orchestrator/control/phases/` mixin tree contains duplicated chunks of capacity logic (including a duplicate `_handle_early_termination`) but is **only exercised by tests, not by production**. Default deletion target for this sprint: the mixin duplication under `control/phases/`. The planner may override that choice only by first showing concretely that the mixins contain logic worth migrating into `control_loop.py` (or by proposing to flip production over to the mixin path \u2014 but that is out of scope for this sprint and would be a separate brief).\n\n---\n\n## Architecture \u2014 what we're building\n\n### New Postgres table\n\n```sql\nCREATE TABLE public.worker_capacity_intents (\n  id                          uuid PRIMARY KEY DEFAULT gen_random_uuid(),\n  pool                        text NOT NULL,\n  route_key                   text,                              -- nullable for pool-wide intents\n  desired_capacity            int  NOT NULL,\n  reason                      text NOT NULL,                     -- 'queued_coverage'|'min_floor'|'cooldown'|...\n  observed_queued             int,\n  observed_active             int,\n  observed_spawning           int,\n  cycle_id                    bigint,\n  created_at                  timestamptz NOT NULL DEFAULT now(),\n  valid_until                 timestamptz,                       -- intent expires; absence \u2260 kill\n  stable_since                timestamptz,                       -- when desired_capacity last changed\n  consecutive_spawn_failures  int  NOT NULL DEFAULT 0,\n  next_spawn_allowed_at       timestamptz,                       -- backoff cooldown\n  shadow                      boolean NOT NULL DEFAULT true      -- shadow vs authoritative mode\n);\n\nCREATE INDEX worker_capacity_intents_pool_route_created\n  ON public.worker_capacity_intents (pool, route_key, created_at DESC);\n```\n\n**One row written per cycle per pool**, regardless of whether the intent changed. This is the audit trail.\n\n**Migration location:** `reigh-worker-orchestrator/sql/` (alongside the existing `2025*_*.sql` files). Filename pattern: `20260514000000_create_worker_capacity_intents.sql`. The repo's existing migration registration system applies \u2014 planner should locate how it's wired (likely `scripts/` or a runner referenced from Railway config) and follow the established pattern.\n\n### Logging \u2014 `system_logs` constraint\n\nExisting `system_logs.valid_source_type` CHECK constraint permits only `orchestrator_gpu`, `orchestrator_api`, and `worker`. **Do not invent a new `source_type` value.** Use `source_type='orchestrator_gpu'` with a metadata tag field (e.g., `metadata->>'shadow_intended_action' = 'true'`) to distinguish shadow log entries from authoritative ones. Saves a migration and avoids breaking other readers of `system_logs`.\n\n### New Python module \u2014 `gpu_orchestrator/control/capacity_reconciler.py`\n\nOwns the full five-phase state machine. Pure-where-possible, side-effects concentrated at boundaries.\n\n```python\nclass CapacityReconciler:\n    def reconcile(self, cycle_id: int) -> ReconciliationResult:\n        observed = self.observe()                     # phase 1: read workers + tasks\n        plan = self.plan(observed)                    # phase 2: compute CapacityPlan\n        admitted = self.admit(plan)                   # phase 3: filter by backoff/cooldown\n        result = self.act(admitted, shadow=self.shadow_mode)  # phase 4: side effects (or log-only)\n        self.record(cycle_id, observed, plan, admitted, result)  # phase 5: persist intent row\n        return result\n```\n\nWhere:\n\n- **`observe()`** is the canonical read of `workers` + `tasks` state. Counts active / spawning / route-stale / idle, computes `total_tasks = queued + in_progress`. Returns a frozen `Observed` dataclass \u2014 **immutable**, taken at one moment in time, passed by value through subsequent phases.\n- **`plan(observed)`** computes ONE `desired_capacity` from ONE formula. Returns a `CapacityPlan` with `desired`, `effective_capacity = active + spawning - admitted_pending_cancels`, `actions = [Spawn | CancelPendingSpawn | TerminateIdle | Noop]`, `reason`, `valid_until`.\n- **`admit(plan)`** is admission control. Checks `next_spawn_allowed_at` per pool, drops `Spawn` actions during cooldown, logs `suppressed_by_backoff`.\n- **`act(admitted, shadow)`** executes side effects when `shadow=False`. When `shadow=True`, logs intended actions to `system_logs` (source_type=`orchestrator_gpu`, metadata tag `shadow_intended_action`). **In shadow mode, `act()` MUST NOT call RunPod, MUST NOT mutate worker rows, MUST NOT update backoff state. Shadow is read-only on the external world.**\n- **`record(...)`** writes one row to `worker_capacity_intents` regardless of mode. The `shadow` boolean column distinguishes shadow rows from authoritative rows.\n\n### Rules the reconciler MUST honor (invariants)\n\nThese are invariants, not preferences. The cycle-trace simulation tests in the deliverables section exist to enforce them.\n\n1. **Spawning workers count as capacity** until they (a) report `spawn_failed`, (b) exceed `active_initializing_max_sec`, or (c) are explicitly cancelled by a `CancelPendingSpawn` action emitted by this reconciler.\n2. **Never kill or cancel a spawning worker because `queued == 0`.** The queue snapshot does not have authority over an authorized spawn.\n3. **Cancel `Spawn` action emission** only when the desired_capacity has remained \u2264 effective for **at least two consecutive observed reconciler snapshots spanning at least `2 * orchestrator_poll_sec` of wall-clock time**, OR the previous intent's `valid_until` has elapsed. Wall-clock based, not iteration-count based \u2014 duplicate Railway replicas or delayed cycles make raw cycle count unreliable.\n4. **Scale down active workers** only via idle timeout + min/buffer constraints. Active workers are never killed by capacity-pressure logic.\n5. **RunPod `spawn_failed` backoff is keyed by `(pool, route_key)`**, not globally. `consecutive_spawn_failures += 1` and `next_spawn_allowed_at = now() + min(2^N * 30s, 600s)`. Successful spawn for that `(pool, route_key)` resets the counter to 0.\n6. **`record()` writes exactly one row per pool per cycle**, even when nothing changed. Audit trail integrity.\n7. **No authoritative spawn action executes without a prior `RECORD` write succeeding** within the same reconciliation. This means `act(shadow=False)` calls `record()` first and only then dispatches RunPod creates / cancellations. Idempotency: if `act()` partially completes and the process crashes, the next cycle sees the recorded intent and can resume.\n8. **Single-writer per pool per cycle in authoritative mode.** Use a Postgres advisory lock keyed on `hashtext(pool)` or a lease row in a small `orchestrator_leases` table, held for the duration of `admit()` + `act()`. Without this, two Railway replicas can each spawn against the same pool's intent and double-provision. (Shadow mode does not need the lock \u2014 multiple shadows are fine since they don't mutate.)\n9. **At cutover, the reconciler must adopt pre-existing spawning workers** that have no associated intent row. These were spawned by the legacy controller before cutover. Treat them as part of effective_capacity; assign a synthetic adoption intent on first observe, do not cancel them.\n\n### Phasing \u2014 what gets deleted, what survives\n\n**Deleted:**\n- `_handle_early_termination` (the entire phase 2 block in `control_loop.py` at lines ~340-400).\n- The `gpu_orchestrator/control/phases/` mixin tree (test-only duplicate code path). Includes any tests that exercised it; replace those with tests against the new reconciler.\n\n**Survives:**\n- Worker lifecycle probing (`_handle_spawning_workers`, heartbeat checks, promote-to-active logic) \u2014 stays in `control_loop.py`.\n- RunPod pod creation primitives (`runpod_client.create_pod` and friends) \u2014 stay. `act()` calls into them.\n- `min_active_gpus`, `machines_to_keep_idle`, `buffer_based` calculations \u2014 stay as **inputs** to `plan()`. **Out of scope for this sprint** is simplifying or renaming them; `plan()` consumes them and emits one authoritative `desired` from one formula. The planner MUST write down exactly that composition (what's the precedence order between `min_active_gpus` floor, `queued_coverage`, and `busy_buffer`?) in the plan output, and gate must verify it's specified.\n\n---\n\n## Rollout strategy \u2014 shadow mode then cutover\n\nThis is a production control loop with money burn and destructive actions. Cutover happens behind a feature flag, gated on observed divergence behavior.\n\n### Phase A \u2014 Shadow deployment (cycle ordering matters)\n\n- Reconciler ships with `shadow_mode=True` (env var: `ORCHESTRATOR_CAPACITY_RECONCILER_MODE=shadow|authoritative`).\n- **Cycle ordering \u2014 explicit, not implicit:** at the start of each orchestrator cycle, after lifecycle probing (`_handle_spawning_workers` etc.) but **before** the legacy `_handle_early_termination` and `_calculate_scaling_decision`, capture an immutable `Observed` snapshot. Pass that frozen snapshot to the shadow reconciler. Let the legacy controller proceed with its normal logic on its own snapshot. Compare outcomes afterward.\n\n  This ordering is non-negotiable: if the shadow runs after legacy mutations, divergence data is contaminated by what legacy already did, and the audit becomes meaningless.\n\n- Shadow does `OBSERVE \u2192 PLAN \u2192 ADMIT \u2192 RECORD`. **It does NOT call `act()` in shadow mode.** Intent rows are written with `shadow=true`.\n- Existing two-controller path continues to be authoritative. Nothing user-facing changes.\n- A divergence audit query becomes the validation surface:\n  ```sql\n  -- Shadow's intended actions per cycle vs. legacy's actual outcomes per cycle, last 24h\n  SELECT\n    sl.created_at::date,\n    sl.metadata->>'pool' AS pool,\n    sl.metadata->>'shadow_intended_action' AS shadow_action,\n    -- join against actual worker-row mutations from legacy controller\n    ...\n  FROM system_logs sl\n  WHERE sl.source_type = 'orchestrator_gpu'\n    AND sl.metadata ? 'shadow_intended_action'\n    AND sl.created_at > now() - interval '24 hours';\n  ```\n  (Planner should write the full join against the `workers` table mutations or against a parallel `legacy_actions` log if one exists.)\n\n### Phase B \u2014 Cutover decision criteria\n\nCutover from shadow to authoritative requires ALL of:\n\n1. **\u226524 hours of shadow mode in production traffic AND \u2265N meaningful capacity events.** \"Meaningful event\" = a cycle where shadow_desired \u2260 legacy_action OR shadow proposed `CancelPendingSpawn` OR backoff suppressed a spawn. N = at least 50; if 24h of normal traffic does not produce 50 such events, extend shadow window until they accumulate.\n2. **Replay validation against captured production state.** Before cutover, the planner must produce a replay test that loads a captured snapshot of `workers` + `tasks` from the actual 2026-05-13 incident window (or a similar pathological window) and runs the reconciler against it. Assert: at the moment `queued` momentarily drops to 0 with active work in flight, the reconciler does NOT emit `CancelPendingSpawn` for the spawning worker. This is the **non-negotiable proof of correctness**.\n3. **No divergence in scenarios where the legacy controller's behavior is correct.** If shadow says spawn while legacy correctly says terminate-idle on a genuinely-idle worker, that's a reconciler bug, not a legacy bug \u2014 fix and re-shadow.\n\n### Phase C \u2014 Cutover\n\n- Flip `ORCHESTRATOR_CAPACITY_RECONCILER_MODE=authoritative`. Reconciler becomes authoritative; legacy controller becomes a no-op stub kept for one more day.\n- **At the moment of flag flip**, the reconciler's first OBSERVE will discover spawning workers with no prior intent row (they were spawned by legacy). Apply rule 9 above (synthetic adoption intent).\n- Watch `scaling-audit --hours 6` output for 4 hours post-cutover. Effective utilisation should rise from baseline.\n- 24h later: delete legacy stub, delete shadow-mode logging, delete the duplicate mixin code path.\n\n---\n\n## Deliverables (acceptance criteria)\n\nThe plan must produce, and execute must ship:\n\n1. **Migration:** `worker_capacity_intents` table + indexes in `sql/20260514000000_create_worker_capacity_intents.sql`, registered with the orchestrator's existing migration system.\n2. **`gpu_orchestrator/control/capacity_reconciler.py`** + supporting modules (`capacity_plan.py` for pure PLAN computation, types/dataclasses for `CapacityPlan` / `Action` / `Observed`).\n3. **`_handle_early_termination` deleted** from `control_loop.py`. Verified by grep returning zero matches.\n4. **`gpu_orchestrator/control/phases/` mixin tree deleted** (and any tests that exercised it removed or rewritten against the new reconciler).\n5. **Single-writer lease/lock mechanism** for authoritative mode (advisory lock or `orchestrator_leases` table; planner picks, defends choice in plan output).\n6. **Cycle-trace simulation tests** under `tests/control/` covering:\n   - **Test A \u2014 Queued snapshot gate:** Queued drops to zero mid-render while 1 active worker has 5 in-progress segments and a spawning replacement is in flight. Reconciler must NOT emit `CancelPendingSpawn`. Spawning worker survives.\n   - **Test B \u2014 Spawn backoff with fake clock:** Use a fake/frozen clock. RunPod returns `spawn_failed` 4 times in succession. Assert exact `next_spawn_allowed_at` after each failure (30s, 60s, 120s, 240s). After the clock advances past `next_spawn_allowed_at`, a fifth attempt succeeds and `consecutive_spawn_failures` resets to 0. **Required: a `Clock` injection seam** in the reconciler \u2014 no `datetime.now()` called directly inside `plan()` or `admit()`.\n   - **Test C \u2014 Time-based hysteresis on cancel:** Spawning worker has been spawning for 250s when `desired_capacity` drops from 2 to 1. Reconciler must NOT immediately cancel. Cancellation may only emit when desired \u2264 effective has held for \u2265 `2 * orchestrator_poll_sec` of wall-clock time across at least two snapshots, OR the previous intent's `valid_until` has elapsed. Test both branches.\n   - **Test D \u2014 Route-stale workers:** A worker with `is_route_stale=True` (per `worker_state.py:83` definition based on `worker_contract_version` and route contract compatibility) is present in the worker list. Reconciler must NOT count it toward `effective_capacity` when satisfying a fresh-route `desired`.\n   - **Test E \u2014 Cutover adoption:** Pre-existing spawning worker rows with no intent-table predecessor are correctly adopted on first authoritative `observe()`. They are not cancelled. A synthetic adoption intent row is written.\n   - **Test F \u2014 Replay against captured incident state:** Load fixture state representing the 2026-05-13 14:11-14:14 window (or equivalent synthetic pathological state). Run reconciler. Assert no oscillation, no premature cancel.\n7. **Shadow-mode infrastructure:** `shadow_mode` flag, immutable `Observed` snapshot captured at the correct point in the cycle (before legacy capacity actions), shadow logging via `source_type='orchestrator_gpu'` + metadata tag, divergence audit SQL committed to `scripts/` or `sql/`.\n8. **`scaling-audit` debug command extended** in `reigh-app/scripts/debug.py` to read `worker_capacity_intents` and report on shadow vs. authoritative cycles, divergence counts, and per-pool intent stability. Cross-repo touch; small and well-scoped.\n9. **Feature-flag cutover plumbing:** `ORCHESTRATOR_CAPACITY_RECONCILER_MODE` env var controls shadow vs. authoritative. No-op stub of legacy controller for 24h post-cutover.\n\n---\n\n## Out of scope (do not touch in this sprint)\n\n- **Cross-pool intent reasoning.** Each pool reconciled independently. Cross-pool rebalancing is a separate brief.\n- **Simplifying `min_active_gpus` / `machines_to_keep_idle` / `buffer_based`.** Stays as input to `plan()`. The plan output must *specify* the composition (precedence order), but not change the input semantics.\n- **UI / dashboard for the intent table.** `SELECT` queries are the interface.\n- **Worker-side code (`reigh-worker/`).** Untouched.\n- **App-side code (`reigh-app/`).** Only the cross-repo touch is extending `scaling-audit` debug command, which is small and well-scoped.\n- **Replacing the existing config/feature-flag system.** Use whatever's already there.\n- **Flipping production to the `control/phases/` mixin path.** Out of scope. The mixins are being deleted, not promoted.\n\n---\n\n## Watch items (gate signals)\n\nThe gate phase MUST verify each of these before allowing execute to proceed:\n\n- **W1: Concurrency on `worker_capacity_intents` writes.** Multiple orchestrator replicas could exist (Railway autoscaling). Planner must specify uniqueness strategy: `UNIQUE (pool, cycle_id)` constraint, advisory lock around the write, or accept duplicates and let queries dedupe. Gate verifies the choice is defensible.\n- **W2: Cutover sequencing.** What happens to in-flight spawning workers at the moment of `shadow_mode=False` flip? Rule 9 specifies adoption; gate verifies the implementation actually does it.\n- **W3: Duplicate code path deletion completeness.** Verify by grep that `gpu_orchestrator/control/phases/` is removed AND no production code path imports from it AND any test rewrites are passing.\n- **W4: Idempotency under cycle restart.** If `act()` partially completes (spawned one of two pods, then process crashes), the next cycle must not double-spawn. Rule 7 addresses this; gate verifies the implementation.\n- **W5: Test fidelity.** Test F's captured-state fixture must be realistic. Planner should examine actual `workers` + `tasks` snapshots from the incident window if available, or synthetic state that reproduces the failure mode.\n- **W6: Single-writer semantics.** Verify the advisory lock or lease implementation prevents two Railway replicas from acting on the same pool's intent simultaneously. Test by spawning two reconciler instances in the test harness against the same DB.\n- **W7: Migration registration.** Verify the new migration in `sql/` is wired into whatever runner the orchestrator uses (likely a script invoked at Railway deploy time or referenced from `railway.json`). Migration must be idempotent.\n- **W8: Cutover adoption test passes.** Test E above must pass before any cutover plan is signed off. Pre-existing spawning workers must not be orphaned or cancelled.\n\n---\n\n## Risk: what would falsify the architectural premise\n\nIf during prep or plan the planner discovers that the \"two formulas computing different `desired`\" diagnosis is wrong \u2014 e.g., the early-term and scale-up phases actually coordinate correctly through some mechanism this brief overlooked \u2014 **stop and report**. Do not proceed with deleting `_handle_early_termination` based on a faulty premise.\n\nLess drastically: if the planner finds that the `CapacityPlan` abstraction can't cleanly express some real-world scenario in the existing `worker_state.py` decision logic (around lines 588-780), surface that during critique. The right answer might be a different decomposition than OBSERVE/PLAN/ADMIT/ACT/RECORD.\n\nThe whole point of running this at `high` author depth is so the planner can push back on the brief's design if it's wrong.\n\n---\n\n## Reference materials in the repo\n\n- `docs/scaling-churn-postmortem-20260513.md` \u2014 symptom-level postmortem.\n- `docs/scaling-churn-approach-20260513.md` \u2014 approach memo that this brief is the formal version of.\n- `reigh-worker-orchestrator/gpu_orchestrator/control_loop.py` \u2014 file being substantially rewritten. Key lines: `:340` (early-term entry), `:362` (current_capacity derivation), `:377` (queued > 0 gate), `:802` (scaling decision call).\n- `reigh-worker-orchestrator/gpu_orchestrator/worker_state.py` \u2014 `:83` (`is_route_stale` definition), `:588` (queued coverage spawn math), `:594` (busy-worker buffer floor), `:616-780` (legacy `desired_workers` block and existing decision logic).\n- `reigh-worker-orchestrator/gpu_orchestrator/control/phases/` \u2014 test-only mixin tree being deleted.\n- `reigh-worker-orchestrator/sql/` \u2014 migration directory; existing files use `YYYYMMDDhhmmss_descriptive_name.sql` pattern.\n- `reigh-app/scripts/debug.py` \u2014 `scaling-audit` command lives here; extend to read the new table.\n- `reigh-worker-orchestrator/railway.json` \u2014 Railway deploy config; check for migration runner wiring.\n\nPrevious successful rollout for reference pattern: `brief-stop-the-cross-boundary-20260513-1358` (today, merged to main as commits `b1675676c`, `04fd9d759`, `d813238a3` in reigh-app; `3bfe7ac9` in reigh-worker; `fcec14f` in reigh-worker-orchestrator).",
+    "significant_flags": 11,
+    "unresolved_flags": [
+      {
+        "id": "FLAG-001",
+        "concern": "Route-key semantics: the plan treats `route_key` as nullable/pool-wide even though the existing task-count path can report one or more selected `route_keys` and the brief requires backoff by `(pool, route_key)`. This can over-suppress spawning for unrelated routes and makes per-route intent audit ambiguous.",
+        "category": "correctness",
+        "severity": "significant",
+        "status": "open"
+      },
+      {
+        "id": "FLAG-002",
+        "concern": "Capacity exclusion: the new `observe()` requirements omit the existing `excluded_from_capacity_control` partition, so live-test or harness-owned workers could be counted or mutated by production capacity reconciliation.",
+        "category": "completeness",
+        "severity": "significant",
+        "status": "open"
+      },
+      {
+        "id": "FLAG-003",
+        "concern": "Cutover staging ambiguity: the plan both accepts final deletion requirements and proposes staged shadow/cutover/cleanup slices, but does not define which acceptance gates apply to each PR or deployable unit.",
+        "category": "completeness",
+        "severity": "significant",
+        "status": "open"
+      },
+      {
+        "id": "issue_hints-1",
+        "concern": "Did the work fully address the issue hints, user notes, and approved plan requirements?: Checked `gpu_orchestrator/control_loop.py` cycle ordering: `run_cycle()` currently calls `_handle_early_termination()` before `_handle_spawning_workers()` at lines 115-119, while the brief requires shadow observation after lifecycle probing and before legacy capacity actions. The plan correctly notices this conflict as an open question, but leaves it unresolved; an executor could either reorder lifecycle probing in Phase A or keep the current order and contaminate the shadow audit.",
+        "category": "completeness",
+        "severity": "significant",
+        "status": "open"
+      },
+      {
+        "id": "issue_hints-2",
+        "concern": "Did the work fully address the issue hints, user notes, and approved plan requirements?: Checked the deletion acceptance criteria against the rollout plan. The brief's deliverables require `_handle_early_termination` and `gpu_orchestrator/control/phases/` to be gone in the shipped final state, while the plan's execution order intentionally keeps legacy behavior through shadow and only deletes in a later cleanup slice; that staged rollout is probably operationally sensible, but it is a divergence that needs an explicit gate definition for which slice is being reviewed.",
+        "category": "completeness",
+        "severity": "significant",
+        "status": "open"
+      },
+      {
+        "id": "correctness-1",
+        "concern": "Are the proposed changes technically correct?: Checked route-aware task metadata in `gpu_orchestrator/database.py` and tests such as `tests/gpu_orchestrator/test_route_aware_task_counts.py`: the selected totals already retain `route_keys`, and `DerivedWorkerState` carries `worker_pool` and route contract fields. The plan assumes `route_key` can stay nullable and pool-wide for the current controller, but invariant 5 requires RunPod spawn backoff keyed by `(pool, route_key)`; using only a pool-wide key can suppress unrelated routes after a failure on one route and weakens the required per-route audit trail.",
+        "category": "correctness",
+        "severity": "significant",
+        "status": "open"
+      },
+      {
+        "id": "correctness-2",
+        "concern": "Are the proposed changes technically correct?: Checked `worker_state.py` route-stale logic and existing scaling tests: route-stale workers are excluded from fresh-route capacity, but the current selected task counts may aggregate multiple compatible `route_keys` into one pool total. The plan does not specify how `Observed.route_key` is chosen when `selected_pool_totals.route_keys` contains more than one key, so the reconciler could write one intent row with a null or arbitrary route key while making decisions from aggregated demand.",
+        "category": "correctness",
+        "severity": "significant",
+        "status": "open"
+      },
+      {
+        "id": "scope",
+        "concern": "Search for related code that handles the same concept. Is the reported issue a symptom of something broader?: Checked the capacity-control boundary in `gpu_orchestrator/live_test_workers.py`, `gpu_orchestrator/control_loop.py`, and `gpu_orchestrator/control/phases/state.py`: the current production loop partitions workers with `excluded_from_capacity_control` before deriving capacity state, while periodic cleanup still sees excluded workers. The plan's `Observed`/`observe()` requirements mention active, spawning, route-stale, and idle counts, but not excluded live-test workers; without carrying this rule forward, the reconciler could count or terminate harness-owned workers that the current controller deliberately excludes from production capacity math.",
+        "category": "completeness",
+        "severity": "significant",
+        "status": "open"
+      },
+      {
+        "id": "all_locations",
+        "concern": "Does the change touch all locations AND supporting infrastructure?: Checked migration infrastructure: `scripts/apply_sql_migrations.py` and `scripts/show_migrations.py` use hardcoded migration filename lists, and `railway.json` starts from `api_orchestrator/Dockerfile` without a migration step. The plan includes registration in those scripts and notes Railway does not apply SQL at boot, so it correctly identifies the main glue work, but the deployment path remains manual unless a separate operational step is added.",
+        "category": "completeness",
+        "severity": "significant",
+        "status": "open"
+      },
+      {
+        "id": "callers-1",
+        "concern": "Find the callers of the changed function. What arguments do they actually pass? Does the fix handle all of them?: Checked the spawn call path in `control_loop.py`: `_execute_scaling()` increments `CycleSummary.workers_spawned` only after `_spawn_worker(queued_count=task_counts.queued)` returns true, and `_spawn_worker()` creates a worker row before calling RunPod then enriches metadata after the RunPod response. The plan's new record-before-act/idempotency path must either extend this helper signature or replace its caller, because the current `DatabaseClient.create_worker_record()` only accepts `worker_id`, `instance_type`, and optional `runpod_id`, not `capacity_intent_id` or action ordinal metadata at initial insert time.",
+        "category": "correctness",
+        "severity": "significant",
+        "status": "open"
+      },
+      {
+        "id": "callers-2",
+        "concern": "Find the callers of the changed function. What arguments do they actually pass? Does the fix handle all of them?: Checked termination callers: early termination updates the worker row even if `runpod.terminate_worker()` returns false, while `_terminate_worker()` returns false and skips the DB status update on RunPod termination failure. The plan says to reuse `_terminate_worker()` semantics for authoritative `TerminateIdle` and `CancelPendingSpawn`, but canceling a pending spawn is closer to the early-termination resilience pattern; otherwise a transient RunPod API failure can leave a spawn counted as live and eligible for repeated cancel attempts.",
+        "category": "correctness",
+        "severity": "significant",
+        "status": "open"
+      }
+    ],
+    "resolved_flags": [],
+    "weighted_score": 17.5,
+    "weighted_history": [],
+    "plan_delta_from_previous": null,
+    "recurring_critiques": [],
+    "scope_creep_flags": [],
+    "loop_summary": "Iteration 1. Weighted score trajectory: 17.5. Plan deltas: n/a. Recurring critiques: 0. Resolved flags: 0. Open significant flags: 11.",
+    "debt_overlaps": [],
+    "escalated_debt_subsystems": []
+  },
+  "warnings": [],
+  "criteria_check": {
+    "count": 22,
+    "items": [
+      {
+        "criterion": "The new SQL migration creates `worker_capacity_intents` with the required columns/index and a lease mechanism suitable for multi-request RunPod side effects.",
+        "priority": "must",
+        "requires": [
+          "read_files",
+          "parse_diff"
+        ]
+      },
+      {
+        "criterion": "The new migration is registered in the repository's migration display/apply scripts or the migration runner is updated to discover it automatically.",
+        "priority": "must",
+        "requires": [
+          "read_files",
+          "parse_diff"
+        ]
+      },
+      {
+        "criterion": "`CapacityReconciler` and pure capacity planning modules exist under `gpu_orchestrator/control/` and implement OBSERVE, PLAN, ADMIT, RECORD, ACT boundaries.",
+        "priority": "must",
+        "requires": [
+          "read_files",
+          "parse_diff"
+        ]
+      },
+      {
+        "criterion": "The pure plan uses one desired-capacity formula with explicit precedence among min floor, queued coverage, and busy-worker idle buffer.",
+        "priority": "must",
+        "requires": [
+          "read_files",
+          "run_tests"
+        ]
+      },
+      {
+        "criterion": "Shadow mode writes intent rows and shadow system_logs metadata but does not call RunPod, mutate worker rows, or update backoff state.",
+        "priority": "must",
+        "requires": [
+          "run_tests",
+          "parse_diff"
+        ]
+      },
+      {
+        "criterion": "Authoritative mode records an intent row successfully before executing any spawn, cancellation, or termination side effect.",
+        "priority": "must",
+        "requires": [
+          "run_tests",
+          "parse_diff"
+        ]
+      },
+      {
+        "criterion": "Authoritative mode enforces single-writer behavior per `(pool, route_key)` so two reconciler instances cannot both spawn for the same pool at the same time.",
+        "priority": "must",
+        "requires": [
+          "run_tests",
+          "parse_diff"
+        ]
+      },
+      {
+        "criterion": "RunPod spawn backoff is keyed by `(pool, route_key)` and tests verify 30s, 60s, 120s, 240s cooldowns plus reset on success using an injected fake clock.",
+        "priority": "must",
+        "requires": [
+          "run_tests"
+        ]
+      },
+      {
+        "criterion": "Queued-zero replay/cycle tests prove a spawning worker is not cancelled merely because queued work momentarily drops to zero while active work remains in progress.",
+        "priority": "must",
+        "requires": [
+          "run_tests"
+        ]
+      },
+      {
+        "criterion": "Cancel hysteresis tests verify cancellation only after the required wall-clock stability window across multiple snapshots or after `valid_until` elapses.",
+        "priority": "must",
+        "requires": [
+          "run_tests"
+        ]
+      },
+      {
+        "criterion": "Route-stale workers are excluded from fresh-route effective capacity and covered by tests.",
+        "priority": "must",
+        "requires": [
+          "run_tests"
+        ]
+      },
+      {
+        "criterion": "Cutover adoption test proves pre-existing spawning workers with no prior authoritative intent are counted as capacity and not cancelled on first authoritative observe.",
+        "priority": "must",
+        "requires": [
+          "run_tests"
+        ]
+      },
+      {
+        "criterion": "`_handle_early_termination` is removed in the final cleanup state, and `rg \"_handle_early_termination\"` returns zero matches.",
+        "priority": "must",
+        "requires": [
+          "run_shell"
+        ]
+      },
+      {
+        "criterion": "`gpu_orchestrator/control/phases/` is removed in the final cleanup state and no production or test code imports `gpu_orchestrator.control.phases`.",
+        "priority": "must",
+        "requires": [
+          "run_shell",
+          "read_files"
+        ]
+      },
+      {
+        "criterion": "`reigh-app/scripts/debug.py scaling-audit` is extended to include `worker_capacity_intents` without breaking the existing command import/compile path.",
+        "priority": "must",
+        "requires": [
+          "read_files",
+          "run_shell"
+        ]
+      },
+      {
+        "criterion": "Targeted reconciler, scaling, and route-stale tests pass.",
+        "priority": "must",
+        "requires": [
+          "run_tests"
+        ]
+      },
+      {
+        "criterion": "The full repository pytest suite passes after legacy phase tests are rewritten or removed.",
+        "priority": "must",
+        "requires": [
+          "run_tests"
+        ]
+      },
+      {
+        "criterion": "The final design keeps lifecycle probing, promotion, health checks, stale route draining, error cleanup, orphan task reconciliation, and periodic zombie/storage checks intact.",
+        "priority": "must",
+        "requires": [
+          "read_files",
+          "parse_diff"
+        ]
+      },
+      {
+        "criterion": "The implementation avoids changing `system_logs.valid_source_type` and uses `orchestrator_gpu` with metadata tags for shadow intent logs.",
+        "priority": "must",
+        "requires": [
+          "read_files",
+          "parse_diff"
+        ]
+      },
+      {
+        "criterion": "Capacity planning code remains mostly pure and is small enough to reason about without hidden database or RunPod calls in PLAN/ADMIT.",
+        "priority": "should",
+        "requires": [
+          "read_files",
+          "subjective_judgment"
+        ]
+      },
+      {
+        "criterion": "Divergence audit SQL is clear enough for operators to inspect shadow-vs-legacy behavior over the last 24h.",
+        "priority": "should",
+        "requires": [
+          "read_files",
+          "subjective_judgment"
+        ]
+      },
+      {
+        "criterion": "Production effective utilization reaches at least 70% sustained over 24h after cutover with no user-task failures attributable to the new controller.",
+        "priority": "info",
+        "requires": [
+          "observe_runtime_logs"
+        ]
+      }
+    ]
+  },
+  "preflight_results": {
+    "project_dir_exists": true,
+    "project_dir_writable": true,
+    "success_criteria_present": true,
+    "claude_available": true,
+    "codex_available": true
+  },
+  "unresolved_flags": [
+    {
+      "id": "FLAG-001",
+      "concern": "Route-key semantics: the plan treats `route_key` as nullable/pool-wide even though the existing task-count path can report one or more selected `route_keys` and the brief requires backoff by `(pool, route_key)`. This can over-suppress spawning for unrelated routes and makes per-route intent audit ambiguous.",
+      "category": "correctness",
+      "severity_hint": "likely-significant",
+      "evidence": "`gpu_orchestrator/database.py` builds `selected_pool_totals.route_keys`; `tests/gpu_orchestrator/test_route_aware_task_counts.py` asserts route keys are retained; plan assumption 2 says `route_key` is nullable and pool-wide.",
+      "raised_in": "critique_v1.json",
+      "status": "open",
+      "severity": "significant",
+      "verified": false
+    },
+    {
+      "id": "FLAG-002",
+      "concern": "Capacity exclusion: the new `observe()` requirements omit the existing `excluded_from_capacity_control` partition, so live-test or harness-owned workers could be counted or mutated by production capacity reconciliation.",
+      "category": "completeness",
+      "severity_hint": "likely-significant",
+      "evidence": "`gpu_orchestrator/control_loop.py` fetches workers then calls `partition_capacity_workers()` before production capacity phases; `gpu_orchestrator/live_test_workers.py` documents that excluded workers bypass capacity math but still get cleanup.",
+      "raised_in": "critique_v1.json",
+      "status": "open",
+      "severity": "significant",
+      "verified": false
+    },
+    {
+      "id": "FLAG-003",
+      "concern": "Cutover staging ambiguity: the plan both accepts final deletion requirements and proposes staged shadow/cutover/cleanup slices, but does not define which acceptance gates apply to each PR or deployable unit.",
+      "category": "completeness",
+      "severity_hint": "uncertain",
+      "evidence": "Deliverables require `_handle_early_termination` grep-zero and `control/phases/` removal; execution order keeps legacy behavior during shadow and deletes in a later cleanup slice.",
+      "raised_in": "critique_v1.json",
+      "status": "open",
+      "severity": "significant",
+      "verified": false
+    },
+    {
+      "id": "issue_hints-1",
+      "concern": "Did the work fully address the issue hints, user notes, and approved plan requirements?: Checked `gpu_orchestrator/control_loop.py` cycle ordering: `run_cycle()` currently calls `_handle_early_termination()` before `_handle_spawning_workers()` at lines 115-119, while the brief requires shadow observation after lifecycle probing and before legacy capacity actions. The plan correctly notices this conflict as an open question, but leaves it unresolved; an executor could either reorder lifecycle probing in Phase A or keep the current order and contaminate the shadow audit.",
+      "category": "completeness",
+      "severity_hint": "likely-significant",
+      "evidence": "Checked `gpu_orchestrator/control_loop.py` cycle ordering: `run_cycle()` currently calls `_handle_early_termination()` before `_handle_spawning_workers()` at lines 115-119, while the brief requires shadow observation after lifecycle probing and before legacy capacity actions. The plan correctly notices this conflict as an open question, but leaves it unresolved; an executor could either reorder lifecycle probing in Phase A or keep the current order and contaminate the shadow audit.",
+      "raised_in": "critique_v1.json",
+      "status": "open",
+      "severity": "significant",
+      "verified": false
+    },
+    {
+      "id": "issue_hints-2",
+      "concern": "Did the work fully address the issue hints, user notes, and approved plan requirements?: Checked the deletion acceptance criteria against the rollout plan. The brief's deliverables require `_handle_early_termination` and `gpu_orchestrator/control/phases/` to be gone in the shipped final state, while the plan's execution order intentionally keeps legacy behavior through shadow and only deletes in a later cleanup slice; that staged rollout is probably operationally sensible, but it is a divergence that needs an explicit gate definition for which slice is being reviewed.",
+      "category": "completeness",
+      "severity_hint": "likely-significant",
+      "evidence": "Checked the deletion acceptance criteria against the rollout plan. The brief's deliverables require `_handle_early_termination` and `gpu_orchestrator/control/phases/` to be gone in the shipped final state, while the plan's execution order intentionally keeps legacy behavior through shadow and only deletes in a later cleanup slice; that staged rollout is probably operationally sensible, but it is a divergence that needs an explicit gate definition for which slice is being reviewed.",
+      "raised_in": "critique_v1.json",
+      "status": "open",
+      "severity": "significant",
+      "verified": false
+    },
+    {
+      "id": "correctness-1",
+      "concern": "Are the proposed changes technically correct?: Checked route-aware task metadata in `gpu_orchestrator/database.py` and tests such as `tests/gpu_orchestrator/test_route_aware_task_counts.py`: the selected totals already retain `route_keys`, and `DerivedWorkerState` carries `worker_pool` and route contract fields. The plan assumes `route_key` can stay nullable and pool-wide for the current controller, but invariant 5 requires RunPod spawn backoff keyed by `(pool, route_key)`; using only a pool-wide key can suppress unrelated routes after a failure on one route and weakens the required per-route audit trail.",
+      "category": "correctness",
+      "severity_hint": "likely-significant",
+      "evidence": "Checked route-aware task metadata in `gpu_orchestrator/database.py` and tests such as `tests/gpu_orchestrator/test_route_aware_task_counts.py`: the selected totals already retain `route_keys`, and `DerivedWorkerState` carries `worker_pool` and route contract fields. The plan assumes `route_key` can stay nullable and pool-wide for the current controller, but invariant 5 requires RunPod spawn backoff keyed by `(pool, route_key)`; using only a pool-wide key can suppress unrelated routes after a failure on one route and weakens the required per-route audit trail.",
+      "raised_in": "critique_v1.json",
+      "status": "open",
+      "severity": "significant",
+      "verified": false
+    },
+    {
+      "id": "correctness-2",
+      "concern": "Are the proposed changes technically correct?: Checked `worker_state.py` route-stale logic and existing scaling tests: route-stale workers are excluded from fresh-route capacity, but the current selected task counts may aggregate multiple compatible `route_keys` into one pool total. The plan does not specify how `Observed.route_key` is chosen when `selected_pool_totals.route_keys` contains more than one key, so the reconciler could write one intent row with a null or arbitrary route key while making decisions from aggregated demand.",
+      "category": "correctness",
+      "severity_hint": "likely-significant",
+      "evidence": "Checked `worker_state.py` route-stale logic and existing scaling tests: route-stale workers are excluded from fresh-route capacity, but the current selected task counts may aggregate multiple compatible `route_keys` into one pool total. The plan does not specify how `Observed.route_key` is chosen when `selected_pool_totals.route_keys` contains more than one key, so the reconciler could write one intent row with a null or arbitrary route key while making decisions from aggregated demand.",
+      "raised_in": "critique_v1.json",
+      "status": "open",
+      "severity": "significant",
+      "verified": false
+    },
+    {
+      "id": "scope",
+      "concern": "Search for related code that handles the same concept. Is the reported issue a symptom of something broader?: Checked the capacity-control boundary in `gpu_orchestrator/live_test_workers.py`, `gpu_orchestrator/control_loop.py`, and `gpu_orchestrator/control/phases/state.py`: the current production loop partitions workers with `excluded_from_capacity_control` before deriving capacity state, while periodic cleanup still sees excluded workers. The plan's `Observed`/`observe()` requirements mention active, spawning, route-stale, and idle counts, but not excluded live-test workers; without carrying this rule forward, the reconciler could count or terminate harness-owned workers that the current controller deliberately excludes from production capacity math.",
+      "category": "completeness",
+      "severity_hint": "likely-significant",
+      "evidence": "Checked the capacity-control boundary in `gpu_orchestrator/live_test_workers.py`, `gpu_orchestrator/control_loop.py`, and `gpu_orchestrator/control/phases/state.py`: the current production loop partitions workers with `excluded_from_capacity_control` before deriving capacity state, while periodic cleanup still sees excluded workers. The plan's `Observed`/`observe()` requirements mention active, spawning, route-stale, and idle counts, but not excluded live-test workers; without carrying this rule forward, the reconciler could count or terminate harness-owned workers that the current controller deliberately excludes from production capacity math.",
+      "raised_in": "critique_v1.json",
+      "status": "open",
+      "severity": "significant",
+      "verified": false
+    },
+    {
+      "id": "all_locations",
+      "concern": "Does the change touch all locations AND supporting infrastructure?: Checked migration infrastructure: `scripts/apply_sql_migrations.py` and `scripts/show_migrations.py` use hardcoded migration filename lists, and `railway.json` starts from `api_orchestrator/Dockerfile` without a migration step. The plan includes registration in those scripts and notes Railway does not apply SQL at boot, so it correctly identifies the main glue work, but the deployment path remains manual unless a separate operational step is added.",
+      "category": "completeness",
+      "severity_hint": "likely-significant",
+      "evidence": "Checked migration infrastructure: `scripts/apply_sql_migrations.py` and `scripts/show_migrations.py` use hardcoded migration filename lists, and `railway.json` starts from `api_orchestrator/Dockerfile` without a migration step. The plan includes registration in those scripts and notes Railway does not apply SQL at boot, so it correctly identifies the main glue work, but the deployment path remains manual unless a separate operational step is added.",
+      "raised_in": "critique_v1.json",
+      "status": "open",
+      "severity": "significant",
+      "verified": false
+    },
+    {
+      "id": "callers-1",
+      "concern": "Find the callers of the changed function. What arguments do they actually pass? Does the fix handle all of them?: Checked the spawn call path in `control_loop.py`: `_execute_scaling()` increments `CycleSummary.workers_spawned` only after `_spawn_worker(queued_count=task_counts.queued)` returns true, and `_spawn_worker()` creates a worker row before calling RunPod then enriches metadata after the RunPod response. The plan's new record-before-act/idempotency path must either extend this helper signature or replace its caller, because the current `DatabaseClient.create_worker_record()` only accepts `worker_id`, `instance_type`, and optional `runpod_id`, not `capacity_intent_id` or action ordinal metadata at initial insert time.",
+      "category": "correctness",
+      "severity_hint": "likely-significant",
+      "evidence": "Checked the spawn call path in `control_loop.py`: `_execute_scaling()` increments `CycleSummary.workers_spawned` only after `_spawn_worker(queued_count=task_counts.queued)` returns true, and `_spawn_worker()` creates a worker row before calling RunPod then enriches metadata after the RunPod response. The plan's new record-before-act/idempotency path must either extend this helper signature or replace its caller, because the current `DatabaseClient.create_worker_record()` only accepts `worker_id`, `instance_type`, and optional `runpod_id`, not `capacity_intent_id` or action ordinal metadata at initial insert time.",
+      "raised_in": "critique_v1.json",
+      "status": "open",
+      "severity": "significant",
+      "verified": false
+    },
+    {
+      "id": "callers-2",
+      "concern": "Find the callers of the changed function. What arguments do they actually pass? Does the fix handle all of them?: Checked termination callers: early termination updates the worker row even if `runpod.terminate_worker()` returns false, while `_terminate_worker()` returns false and skips the DB status update on RunPod termination failure. The plan says to reuse `_terminate_worker()` semantics for authoritative `TerminateIdle` and `CancelPendingSpawn`, but canceling a pending spawn is closer to the early-termination resilience pattern; otherwise a transient RunPod API failure can leave a spawn counted as live and eligible for repeated cancel attempts.",
+      "category": "correctness",
+      "severity_hint": "likely-significant",
+      "evidence": "Checked termination callers: early termination updates the worker row even if `runpod.terminate_worker()` returns false, while `_terminate_worker()` returns false and skips the DB status update on RunPod termination failure. The plan says to reuse `_terminate_worker()` semantics for authoritative `TerminateIdle` and `CancelPendingSpawn`, but canceling a pending spawn is closer to the early-termination resilience pattern; otherwise a transient RunPod API failure can leave a spawn counted as live and eligible for repeated cancel attempts.",
+      "raised_in": "critique_v1.json",
+      "status": "open",
+      "severity": "significant",
+      "verified": false
+    }
+  ]
+}

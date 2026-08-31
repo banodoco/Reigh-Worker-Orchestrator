@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 VALID_WORKER_BACKENDS = {"wgp", "vibecomfy"}
+VALID_CAPACITY_RECONCILER_MODES = {"off", "shadow", "authoritative"}
 
 
 def _env_str(*names: str, default: str) -> str:
@@ -36,6 +37,16 @@ def _env_backend(*names: str, default: str = "wgp") -> str:
     if value not in VALID_WORKER_BACKENDS:
         raise ValueError(
             f"Unsupported worker backend {value!r}; expected one of {sorted(VALID_WORKER_BACKENDS)}"
+        )
+    return value
+
+
+def _env_capacity_reconciler_mode() -> str:
+    value = _env_str("ORCHESTRATOR_CAPACITY_RECONCILER_MODE", default="off").lower()
+    if value not in VALID_CAPACITY_RECONCILER_MODES:
+        raise ValueError(
+            "Unsupported ORCHESTRATOR_CAPACITY_RECONCILER_MODE "
+            f"{value!r}; expected one of {sorted(VALID_CAPACITY_RECONCILER_MODES)}"
         )
     return value
 
@@ -110,6 +121,7 @@ class OrchestratorConfig:
 
     # Feature flags
     use_new_scaling_logic: bool
+    capacity_reconciler_mode: str = "off"
 
     @classmethod
     def from_env(cls) -> 'OrchestratorConfig':
@@ -209,6 +221,7 @@ class OrchestratorConfig:
 
             # Feature flags
             use_new_scaling_logic=os.getenv("USE_NEW_SCALING_LOGIC", "true").lower() == "true",
+            capacity_reconciler_mode=_env_capacity_reconciler_mode(),
         )
 
     def log_config(self):
@@ -227,4 +240,8 @@ class OrchestratorConfig:
         logger.info(f"   Route contract: backend={self.worker_backend}, profile={self.worker_profile}, pool={self.worker_pool}, selector={self.selector_namespace}/{self.selector_version or 'default'}, contract={self.worker_contract_version}, run_id={self.worker_run_id or 'unset'}")
         logger.info(f"   Polling: {self.orchestrator_poll_sec}s")
         logger.info(f"   Auto-start worker: {self.auto_start_worker_process}")
-        logger.info(f"   Feature flags: use_new_scaling_logic={self.use_new_scaling_logic}")
+        logger.info(
+            "   Feature flags: "
+            f"use_new_scaling_logic={self.use_new_scaling_logic}, "
+            f"capacity_reconciler_mode={self.capacity_reconciler_mode}"
+        )

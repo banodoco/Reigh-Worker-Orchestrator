@@ -1,0 +1,440 @@
+{
+  "name": "capacity-reconciler-20260513-v2",
+  "idea": "# brief-unify-capacity-control-20260513\n\n**Profile:** `all-codex/standard/high`\n**Repo:** `reigh-worker-orchestrator` (Python, Railway-deployed) + small cross-repo touch in `reigh-app/scripts/debug.py`\n**Branch base:** `origin/main` at `fcec14f`\n**Rollout:** shadow-mode \u2192 divergence audit \u2192 flag-flip cutover\n\n> **Brief revision history:** drafted 2026-05-13. Sense-checked by Codex GPT-5.5 `high` (read-only, repo-aware). Corrections from that review folded in below \u2014 most importantly: code-level claims about `calculate_scaling_decision_pure` and the cycle phase order have been corrected against ground truth.\n\n---\n\n## Goal\n\nReplace the orchestrator's two-controller scaling loop with one durable-intent reconciler. Specifically:\n\n1. Introduce `worker_capacity_intents` (Postgres) as the durable source of truth for \"what capacity should exist right now, for what reason, with what cooldowns.\"\n2. Build `gpu_orchestrator/control/capacity_reconciler.py` with an explicit five-phase state machine: **OBSERVE \u2192 PLAN \u2192 ADMIT \u2192 ACT \u2192 RECORD**.\n3. Delete `_handle_early_termination` entirely. Its job becomes a `cancel_pending_spawn` action emitted by the reconciler under strictly-defined conditions.\n4. Fold RunPod `spawn_failed` backoff into the same reconciler as admission control (no separate guardrail path).\n5. Delete the test-only duplicate code path under `gpu_orchestrator/control/phases/` (which is *not* the production runtime path \u2014 see \"Context\" below).\n6. Roll out via shadow mode: new reconciler runs alongside the existing controller, logs intended actions, doesn't take effect until a feature flag flips.\n\nSuccess is measured by **production effective-utilisation rising from ~4% to \u226570%** sustained over 24h post-cutover, with no user-task failures attributable to the new controller.\n\n---\n\n## Context \u2014 what's broken\n\nA 2-hour rollout window on 2026-05-13 observed **73 GPU workers spawned, 70 killed before becoming productive, 1 worker did all the actual work** (4% effective utilisation). The same pattern is present in git history going back at least 6 weeks.\n\nTwo parallel Codex GPT-5.5 sense-checks (independent runs, no cross-talk) reading `gpu_orchestrator/control_loop.py` converged on a single architectural diagnosis, **subsequently verified by a third Codex `high` review** against the actual code:\n\n> The orchestrator runs **two independent capacity controllers** in one cycle. `_handle_early_termination` (around `control_loop.py:340`, `current_capacity` derived at `:362`, gate check at `:377`) computes one `desired` figure from `task_counts.total * scale_down_multiplier` + min GPUs + idle buffer. Later in the same cycle, `_calculate_scaling_decision` calls `calculate_scaling_decision_pure` at `control_loop.py:802` (when `use_new_scaling_logic` is enabled), which emits spawn action math from queued coverage (`workers_covering_tasks = idle + spawning`, `uncovered_tasks = queued - workers_covering_tasks`, `spawn_for_tasks = uncovered_tasks`, see `worker_state.py:588`) plus a busy-worker buffer floor (`worker_state.py:594`). **However**, `desired_workers` itself is still populated from the legacy `total_workload * scale_up_multiplier`, `busy + idle buffer`, and `min_active_gpus` block at `worker_state.py:616`.\n>\n> The bug is **not** \"stale snapshot between phases\" \u2014 the scaling decision is computed *after* early-term, not before. The bug is that early-term **mutates the worker list** (terminating spawning workers) before a second, separate scaling formula runs against the same phase-1 task snapshot and the now-changed worker list. Two formulas, two notions of `desired`, one cycle, opposing actions.\n\nThree named failure modes ride on this defect:\n\n- **Spawn churn from snapshot gates.** `_handle_early_termination` is guarded by `if task_counts.queued > 0` (at `control_loop.py:377`). `task_counts.queued` is an instantaneous snapshot taken once at the top of each cycle. When the single productive worker had just claimed a segment (queue momentarily empty, six in-progress segments active), early-term fired and killed the spawning replacement. Next cycle re-spawned. Loop.\n- **No backoff for RunPod `spawn_failed`.** 55 of the 73 deaths were RunPod refusing pod allocation. The orchestrator retried at 30-second cycle cadence indefinitely.\n- **Mutating actions sequenced before mismatched re-derivation.** Early-term terminates spawning workers from the worker list, then `_calculate_scaling_decision` re-derives `desired` against the same phase-1 task snapshot but a now-shorter worker list, and decides to re-spawn what early-term just killed.\n\nA team-authored postmortem (`/Users/peteromalley/Documents/reigh-workspace/docs/scaling-churn-postmortem-20260513.md`) and approach memo (`/Users/peteromalley/Documents/reigh-workspace/docs/scaling-churn-approach-20260513.md`) cover the symptom-level analysis. The architectural prescription below is the *deep* fix.\n\n### Duplicate code path \u2014 clarified\n\n`gpu_orchestrator/control_loop.py` is **the** production runtime path. `main.py` imports `OrchestratorControlLoop` from it. The `gpu_orchestrator/control/phases/` mixin tree contains duplicated chunks of capacity logic (including a duplicate `_handle_early_termination`) but is **only exercised by tests, not by production**. Default deletion target for this sprint: the mixin duplication under `control/phases/`. The planner may override that choice only by first showing concretely that the mixins contain logic worth migrating into `control_loop.py` (or by proposing to flip production over to the mixin path \u2014 but that is out of scope for this sprint and would be a separate brief).\n\n---\n\n## Architecture \u2014 what we're building\n\n### New Postgres table\n\n```sql\nCREATE TABLE public.worker_capacity_intents (\n  id                          uuid PRIMARY KEY DEFAULT gen_random_uuid(),\n  pool                        text NOT NULL,\n  route_key                   text,                              -- nullable for pool-wide intents\n  desired_capacity            int  NOT NULL,\n  reason                      text NOT NULL,                     -- 'queued_coverage'|'min_floor'|'cooldown'|...\n  observed_queued             int,\n  observed_active             int,\n  observed_spawning           int,\n  cycle_id                    bigint,\n  created_at                  timestamptz NOT NULL DEFAULT now(),\n  valid_until                 timestamptz,                       -- intent expires; absence \u2260 kill\n  stable_since                timestamptz,                       -- when desired_capacity last changed\n  consecutive_spawn_failures  int  NOT NULL DEFAULT 0,\n  next_spawn_allowed_at       timestamptz,                       -- backoff cooldown\n  shadow                      boolean NOT NULL DEFAULT true      -- shadow vs authoritative mode\n);\n\nCREATE INDEX worker_capacity_intents_pool_route_created\n  ON public.worker_capacity_intents (pool, route_key, created_at DESC);\n```\n\n**One row written per cycle per pool**, regardless of whether the intent changed. This is the audit trail.\n\n**Migration location:** `reigh-worker-orchestrator/sql/` (alongside the existing `2025*_*.sql` files). Filename pattern: `20260514000000_create_worker_capacity_intents.sql`. The repo's existing migration registration system applies \u2014 planner should locate how it's wired (likely `scripts/` or a runner referenced from Railway config) and follow the established pattern.\n\n### Logging \u2014 `system_logs` constraint\n\nExisting `system_logs.valid_source_type` CHECK constraint permits only `orchestrator_gpu`, `orchestrator_api`, and `worker`. **Do not invent a new `source_type` value.** Use `source_type='orchestrator_gpu'` with a metadata tag field (e.g., `metadata->>'shadow_intended_action' = 'true'`) to distinguish shadow log entries from authoritative ones. Saves a migration and avoids breaking other readers of `system_logs`.\n\n### New Python module \u2014 `gpu_orchestrator/control/capacity_reconciler.py`\n\nOwns the full five-phase state machine. Pure-where-possible, side-effects concentrated at boundaries.\n\n```python\nclass CapacityReconciler:\n    def reconcile(self, cycle_id: int) -> ReconciliationResult:\n        observed = self.observe()                     # phase 1: read workers + tasks\n        plan = self.plan(observed)                    # phase 2: compute CapacityPlan\n        admitted = self.admit(plan)                   # phase 3: filter by backoff/cooldown\n        result = self.act(admitted, shadow=self.shadow_mode)  # phase 4: side effects (or log-only)\n        self.record(cycle_id, observed, plan, admitted, result)  # phase 5: persist intent row\n        return result\n```\n\nWhere:\n\n- **`observe()`** is the canonical read of `workers` + `tasks` state. Counts active / spawning / route-stale / idle, computes `total_tasks = queued + in_progress`. Returns a frozen `Observed` dataclass \u2014 **immutable**, taken at one moment in time, passed by value through subsequent phases.\n- **`plan(observed)`** computes ONE `desired_capacity` from ONE formula. Returns a `CapacityPlan` with `desired`, `effective_capacity = active + spawning - admitted_pending_cancels`, `actions = [Spawn | CancelPendingSpawn | TerminateIdle | Noop]`, `reason`, `valid_until`.\n- **`admit(plan)`** is admission control. Checks `next_spawn_allowed_at` per pool, drops `Spawn` actions during cooldown, logs `suppressed_by_backoff`.\n- **`act(admitted, shadow)`** executes side effects when `shadow=False`. When `shadow=True`, logs intended actions to `system_logs` (source_type=`orchestrator_gpu`, metadata tag `shadow_intended_action`). **In shadow mode, `act()` MUST NOT call RunPod, MUST NOT mutate worker rows, MUST NOT update backoff state. Shadow is read-only on the external world.**\n- **`record(...)`** writes one row to `worker_capacity_intents` regardless of mode. The `shadow` boolean column distinguishes shadow rows from authoritative rows.\n\n### Rules the reconciler MUST honor (invariants)\n\nThese are invariants, not preferences. The cycle-trace simulation tests in the deliverables section exist to enforce them.\n\n1. **Spawning workers count as capacity** until they (a) report `spawn_failed`, (b) exceed `active_initializing_max_sec`, or (c) are explicitly cancelled by a `CancelPendingSpawn` action emitted by this reconciler.\n2. **Never kill or cancel a spawning worker because `queued == 0`.** The queue snapshot does not have authority over an authorized spawn.\n3. **Cancel `Spawn` action emission** only when the desired_capacity has remained \u2264 effective for **at least two consecutive observed reconciler snapshots spanning at least `2 * orchestrator_poll_sec` of wall-clock time**, OR the previous intent's `valid_until` has elapsed. Wall-clock based, not iteration-count based \u2014 duplicate Railway replicas or delayed cycles make raw cycle count unreliable.\n4. **Scale down active workers** only via idle timeout + min/buffer constraints. Active workers are never killed by capacity-pressure logic.\n5. **RunPod `spawn_failed` backoff is keyed by `(pool, route_key)`**, not globally. `consecutive_spawn_failures += 1` and `next_spawn_allowed_at = now() + min(2^N * 30s, 600s)`. Successful spawn for that `(pool, route_key)` resets the counter to 0.\n6. **`record()` writes exactly one row per pool per cycle**, even when nothing changed. Audit trail integrity.\n7. **No authoritative spawn action executes without a prior `RECORD` write succeeding** within the same reconciliation. This means `act(shadow=False)` calls `record()` first and only then dispatches RunPod creates / cancellations. Idempotency: if `act()` partially completes and the process crashes, the next cycle sees the recorded intent and can resume.\n8. **Single-writer per pool per cycle in authoritative mode.** Use a Postgres advisory lock keyed on `hashtext(pool)` or a lease row in a small `orchestrator_leases` table, held for the duration of `admit()` + `act()`. Without this, two Railway replicas can each spawn against the same pool's intent and double-provision. (Shadow mode does not need the lock \u2014 multiple shadows are fine since they don't mutate.)\n9. **At cutover, the reconciler must adopt pre-existing spawning workers** that have no associated intent row. These were spawned by the legacy controller before cutover. Treat them as part of effective_capacity; assign a synthetic adoption intent on first observe, do not cancel them.\n\n### Phasing \u2014 what gets deleted, what survives\n\n**Deleted:**\n- `_handle_early_termination` (the entire phase 2 block in `control_loop.py` at lines ~340-400).\n- The `gpu_orchestrator/control/phases/` mixin tree (test-only duplicate code path). Includes any tests that exercised it; replace those with tests against the new reconciler.\n\n**Survives:**\n- Worker lifecycle probing (`_handle_spawning_workers`, heartbeat checks, promote-to-active logic) \u2014 stays in `control_loop.py`.\n- RunPod pod creation primitives (`runpod_client.create_pod` and friends) \u2014 stay. `act()` calls into them.\n- `min_active_gpus`, `machines_to_keep_idle`, `buffer_based` calculations \u2014 stay as **inputs** to `plan()`. **Out of scope for this sprint** is simplifying or renaming them; `plan()` consumes them and emits one authoritative `desired` from one formula. The planner MUST write down exactly that composition (what's the precedence order between `min_active_gpus` floor, `queued_coverage`, and `busy_buffer`?) in the plan output, and gate must verify it's specified.\n\n---\n\n## Rollout strategy \u2014 shadow mode then cutover\n\nThis is a production control loop with money burn and destructive actions. Cutover happens behind a feature flag, gated on observed divergence behavior.\n\n### Phase A \u2014 Shadow deployment (cycle ordering matters)\n\n- Reconciler ships with `shadow_mode=True` (env var: `ORCHESTRATOR_CAPACITY_RECONCILER_MODE=shadow|authoritative`).\n- **Cycle ordering \u2014 explicit, not implicit:** at the start of each orchestrator cycle, after lifecycle probing (`_handle_spawning_workers` etc.) but **before** the legacy `_handle_early_termination` and `_calculate_scaling_decision`, capture an immutable `Observed` snapshot. Pass that frozen snapshot to the shadow reconciler. Let the legacy controller proceed with its normal logic on its own snapshot. Compare outcomes afterward.\n\n  This ordering is non-negotiable: if the shadow runs after legacy mutations, divergence data is contaminated by what legacy already did, and the audit becomes meaningless.\n\n- Shadow does `OBSERVE \u2192 PLAN \u2192 ADMIT \u2192 RECORD`. **It does NOT call `act()` in shadow mode.** Intent rows are written with `shadow=true`.\n- Existing two-controller path continues to be authoritative. Nothing user-facing changes.\n- A divergence audit query becomes the validation surface:\n  ```sql\n  -- Shadow's intended actions per cycle vs. legacy's actual outcomes per cycle, last 24h\n  SELECT\n    sl.created_at::date,\n    sl.metadata->>'pool' AS pool,\n    sl.metadata->>'shadow_intended_action' AS shadow_action,\n    -- join against actual worker-row mutations from legacy controller\n    ...\n  FROM system_logs sl\n  WHERE sl.source_type = 'orchestrator_gpu'\n    AND sl.metadata ? 'shadow_intended_action'\n    AND sl.created_at > now() - interval '24 hours';\n  ```\n  (Planner should write the full join against the `workers` table mutations or against a parallel `legacy_actions` log if one exists.)\n\n### Phase B \u2014 Cutover decision criteria\n\nCutover from shadow to authoritative requires ALL of:\n\n1. **\u226524 hours of shadow mode in production traffic AND \u2265N meaningful capacity events.** \"Meaningful event\" = a cycle where shadow_desired \u2260 legacy_action OR shadow proposed `CancelPendingSpawn` OR backoff suppressed a spawn. N = at least 50; if 24h of normal traffic does not produce 50 such events, extend shadow window until they accumulate.\n2. **Replay validation against captured production state.** Before cutover, the planner must produce a replay test that loads a captured snapshot of `workers` + `tasks` from the actual 2026-05-13 incident window (or a similar pathological window) and runs the reconciler against it. Assert: at the moment `queued` momentarily drops to 0 with active work in flight, the reconciler does NOT emit `CancelPendingSpawn` for the spawning worker. This is the **non-negotiable proof of correctness**.\n3. **No divergence in scenarios where the legacy controller's behavior is correct.** If shadow says spawn while legacy correctly says terminate-idle on a genuinely-idle worker, that's a reconciler bug, not a legacy bug \u2014 fix and re-shadow.\n\n### Phase C \u2014 Cutover\n\n- Flip `ORCHESTRATOR_CAPACITY_RECONCILER_MODE=authoritative`. Reconciler becomes authoritative; legacy controller becomes a no-op stub kept for one more day.\n- **At the moment of flag flip**, the reconciler's first OBSERVE will discover spawning workers with no prior intent row (they were spawned by legacy). Apply rule 9 above (synthetic adoption intent).\n- Watch `scaling-audit --hours 6` output for 4 hours post-cutover. Effective utilisation should rise from baseline.\n- 24h later: delete legacy stub, delete shadow-mode logging, delete the duplicate mixin code path.\n\n---\n\n## Deliverables (acceptance criteria)\n\nThe plan must produce, and execute must ship:\n\n1. **Migration:** `worker_capacity_intents` table + indexes in `sql/20260514000000_create_worker_capacity_intents.sql`, registered with the orchestrator's existing migration system.\n2. **`gpu_orchestrator/control/capacity_reconciler.py`** + supporting modules (`capacity_plan.py` for pure PLAN computation, types/dataclasses for `CapacityPlan` / `Action` / `Observed`).\n3. **`_handle_early_termination` deleted** from `control_loop.py`. Verified by grep returning zero matches.\n4. **`gpu_orchestrator/control/phases/` mixin tree deleted** (and any tests that exercised it removed or rewritten against the new reconciler).\n5. **Single-writer lease/lock mechanism** for authoritative mode (advisory lock or `orchestrator_leases` table; planner picks, defends choice in plan output).\n6. **Cycle-trace simulation tests** under `tests/control/` covering:\n   - **Test A \u2014 Queued snapshot gate:** Queued drops to zero mid-render while 1 active worker has 5 in-progress segments and a spawning replacement is in flight. Reconciler must NOT emit `CancelPendingSpawn`. Spawning worker survives.\n   - **Test B \u2014 Spawn backoff with fake clock:** Use a fake/frozen clock. RunPod returns `spawn_failed` 4 times in succession. Assert exact `next_spawn_allowed_at` after each failure (30s, 60s, 120s, 240s). After the clock advances past `next_spawn_allowed_at`, a fifth attempt succeeds and `consecutive_spawn_failures` resets to 0. **Required: a `Clock` injection seam** in the reconciler \u2014 no `datetime.now()` called directly inside `plan()` or `admit()`.\n   - **Test C \u2014 Time-based hysteresis on cancel:** Spawning worker has been spawning for 250s when `desired_capacity` drops from 2 to 1. Reconciler must NOT immediately cancel. Cancellation may only emit when desired \u2264 effective has held for \u2265 `2 * orchestrator_poll_sec` of wall-clock time across at least two snapshots, OR the previous intent's `valid_until` has elapsed. Test both branches.\n   - **Test D \u2014 Route-stale workers:** A worker with `is_route_stale=True` (per `worker_state.py:83` definition based on `worker_contract_version` and route contract compatibility) is present in the worker list. Reconciler must NOT count it toward `effective_capacity` when satisfying a fresh-route `desired`.\n   - **Test E \u2014 Cutover adoption:** Pre-existing spawning worker rows with no intent-table predecessor are correctly adopted on first authoritative `observe()`. They are not cancelled. A synthetic adoption intent row is written.\n   - **Test F \u2014 Replay against captured incident state:** Load fixture state representing the 2026-05-13 14:11-14:14 window (or equivalent synthetic pathological state). Run reconciler. Assert no oscillation, no premature cancel.\n7. **Shadow-mode infrastructure:** `shadow_mode` flag, immutable `Observed` snapshot captured at the correct point in the cycle (before legacy capacity actions), shadow logging via `source_type='orchestrator_gpu'` + metadata tag, divergence audit SQL committed to `scripts/` or `sql/`.\n8. **`scaling-audit` debug command extended** in `reigh-app/scripts/debug.py` to read `worker_capacity_intents` and report on shadow vs. authoritative cycles, divergence counts, and per-pool intent stability. Cross-repo touch; small and well-scoped.\n9. **Feature-flag cutover plumbing:** `ORCHESTRATOR_CAPACITY_RECONCILER_MODE` env var controls shadow vs. authoritative. No-op stub of legacy controller for 24h post-cutover.\n\n---\n\n## Out of scope (do not touch in this sprint)\n\n- **Cross-pool intent reasoning.** Each pool reconciled independently. Cross-pool rebalancing is a separate brief.\n- **Simplifying `min_active_gpus` / `machines_to_keep_idle` / `buffer_based`.** Stays as input to `plan()`. The plan output must *specify* the composition (precedence order), but not change the input semantics.\n- **UI / dashboard for the intent table.** `SELECT` queries are the interface.\n- **Worker-side code (`reigh-worker/`).** Untouched.\n- **App-side code (`reigh-app/`).** Only the cross-repo touch is extending `scaling-audit` debug command, which is small and well-scoped.\n- **Replacing the existing config/feature-flag system.** Use whatever's already there.\n- **Flipping production to the `control/phases/` mixin path.** Out of scope. The mixins are being deleted, not promoted.\n\n---\n\n## Watch items (gate signals)\n\nThe gate phase MUST verify each of these before allowing execute to proceed:\n\n- **W1: Concurrency on `worker_capacity_intents` writes.** Multiple orchestrator replicas could exist (Railway autoscaling). Planner must specify uniqueness strategy: `UNIQUE (pool, cycle_id)` constraint, advisory lock around the write, or accept duplicates and let queries dedupe. Gate verifies the choice is defensible.\n- **W2: Cutover sequencing.** What happens to in-flight spawning workers at the moment of `shadow_mode=False` flip? Rule 9 specifies adoption; gate verifies the implementation actually does it.\n- **W3: Duplicate code path deletion completeness.** Verify by grep that `gpu_orchestrator/control/phases/` is removed AND no production code path imports from it AND any test rewrites are passing.\n- **W4: Idempotency under cycle restart.** If `act()` partially completes (spawned one of two pods, then process crashes), the next cycle must not double-spawn. Rule 7 addresses this; gate verifies the implementation.\n- **W5: Test fidelity.** Test F's captured-state fixture must be realistic. Planner should examine actual `workers` + `tasks` snapshots from the incident window if available, or synthetic state that reproduces the failure mode.\n- **W6: Single-writer semantics.** Verify the advisory lock or lease implementation prevents two Railway replicas from acting on the same pool's intent simultaneously. Test by spawning two reconciler instances in the test harness against the same DB.\n- **W7: Migration registration.** Verify the new migration in `sql/` is wired into whatever runner the orchestrator uses (likely a script invoked at Railway deploy time or referenced from `railway.json`). Migration must be idempotent.\n- **W8: Cutover adoption test passes.** Test E above must pass before any cutover plan is signed off. Pre-existing spawning workers must not be orphaned or cancelled.\n\n---\n\n## Risk: what would falsify the architectural premise\n\nIf during prep or plan the planner discovers that the \"two formulas computing different `desired`\" diagnosis is wrong \u2014 e.g., the early-term and scale-up phases actually coordinate correctly through some mechanism this brief overlooked \u2014 **stop and report**. Do not proceed with deleting `_handle_early_termination` based on a faulty premise.\n\nLess drastically: if the planner finds that the `CapacityPlan` abstraction can't cleanly express some real-world scenario in the existing `worker_state.py` decision logic (around lines 588-780), surface that during critique. The right answer might be a different decomposition than OBSERVE/PLAN/ADMIT/ACT/RECORD.\n\nThe whole point of running this at `high` author depth is so the planner can push back on the brief's design if it's wrong.\n\n---\n\n## Reference materials in the repo\n\n- `docs/scaling-churn-postmortem-20260513.md` \u2014 symptom-level postmortem.\n- `docs/scaling-churn-approach-20260513.md` \u2014 approach memo that this brief is the formal version of.\n- `reigh-worker-orchestrator/gpu_orchestrator/control_loop.py` \u2014 file being substantially rewritten. Key lines: `:340` (early-term entry), `:362` (current_capacity derivation), `:377` (queued > 0 gate), `:802` (scaling decision call).\n- `reigh-worker-orchestrator/gpu_orchestrator/worker_state.py` \u2014 `:83` (`is_route_stale` definition), `:588` (queued coverage spawn math), `:594` (busy-worker buffer floor), `:616-780` (legacy `desired_workers` block and existing decision logic).\n- `reigh-worker-orchestrator/gpu_orchestrator/control/phases/` \u2014 test-only mixin tree being deleted.\n- `reigh-worker-orchestrator/sql/` \u2014 migration directory; existing files use `YYYYMMDDhhmmss_descriptive_name.sql` pattern.\n- `reigh-app/scripts/debug.py` \u2014 `scaling-audit` command lives here; extend to read the new table.\n- `reigh-worker-orchestrator/railway.json` \u2014 Railway deploy config; check for migration runner wiring.\n\nPrevious successful rollout for reference pattern: `brief-stop-the-cross-boundary-20260513-1358` (today, merged to main as commits `b1675676c`, `04fd9d759`, `d813238a3` in reigh-app; `3bfe7ac9` in reigh-worker; `fcec14f` in reigh-worker-orchestrator).",
+  "current_state": "finalized",
+  "iteration": 4,
+  "created_at": "2026-05-13T19:00:31Z",
+  "config": {
+    "project_dir": "/Users/peteromalley/Documents/reigh-workspace/reigh-worker-orchestrator-capacity-reconciler",
+    "auto_approve": true,
+    "robustness": "standard",
+    "mode": "code",
+    "strict_notes": false,
+    "agent": "",
+    "profile": "all-codex",
+    "depth": "high",
+    "phase_model": [
+      "plan=codex:high",
+      "prep=codex",
+      "critique=codex",
+      "revise=codex:high",
+      "gate=codex",
+      "finalize=codex",
+      "execute=codex",
+      "feedback=claude:low",
+      "loop_plan=codex:high",
+      "loop_execute=codex",
+      "review=codex",
+      "tiebreaker_researcher=codex:high",
+      "tiebreaker_challenger=codex:high"
+    ]
+  },
+  "sessions": {
+    "codex_planner": {
+      "id": "019e22b6-4740-7963-aef9-94767d19a8c3",
+      "mode": "persistent",
+      "created_at": "2026-05-13T19:05:33Z",
+      "last_used_at": "2026-05-13T19:22:30Z",
+      "refreshed": false
+    },
+    "codex_critic": {
+      "id": "019e22ba-e953-7583-8449-a1f717f5177d",
+      "mode": "persistent",
+      "created_at": "2026-05-13T19:08:22Z",
+      "last_used_at": "2026-05-13T19:23:29Z",
+      "refreshed": false
+    },
+    "codex_gatekeeper": {
+      "id": "019e22bd-7ee1-7c80-be5f-d9fd2ed6741a",
+      "mode": "persistent",
+      "created_at": "2026-05-13T19:08:41Z",
+      "last_used_at": "2026-05-13T19:23:51Z",
+      "refreshed": false
+    },
+    "codex_finalizer": {
+      "id": "019e22cb-a935-72d1-a29a-27d282186496",
+      "mode": "persistent",
+      "created_at": "2026-05-13T19:25:29Z",
+      "last_used_at": "2026-05-13T19:28:20Z",
+      "refreshed": false
+    },
+    "codex_executor": {
+      "id": "019e230e-8d2c-7302-ba3d-dfefc9623980",
+      "mode": "persistent",
+      "created_at": "2026-05-13T20:41:25Z",
+      "last_used_at": "2026-05-13T20:54:34Z",
+      "refreshed": false
+    }
+  },
+  "plan_versions": [
+    {
+      "version": 1,
+      "file": "plan_v1.md",
+      "hash": "sha256:1f053c65f3acef1d93f4f935bf28bd7a2be66c7cdf67517d62e79fc5b453b350",
+      "timestamp": "2026-05-13T19:05:33Z"
+    },
+    {
+      "version": 2,
+      "file": "plan_v2.md",
+      "hash": "sha256:e09580c0105e2667b6f17f27ac9c2d30782160c41d9fc292a1f062afdd10e17b",
+      "timestamp": "2026-05-13T19:12:17Z"
+    },
+    {
+      "version": 3,
+      "file": "plan_v3.md",
+      "hash": "sha256:a4e94347b88cdd42c7950303c7e59d657311209fd7beae9f1d71a3b20d4ffc8e",
+      "timestamp": "2026-05-13T19:17:35Z"
+    },
+    {
+      "version": 4,
+      "file": "plan_v4.md",
+      "hash": "sha256:2231dc3030248323250a0959374d6eaa5eaacdab0ca722fcc74639420816aa0e",
+      "timestamp": "2026-05-13T19:22:30Z"
+    }
+  ],
+  "history": [
+    {
+      "step": "init",
+      "timestamp": "2026-05-13T19:00:31Z",
+      "duration_ms": 0,
+      "cost_usd": 0.0,
+      "result": "success",
+      "environment": {
+        "claude": true,
+        "codex": true
+      }
+    },
+    {
+      "step": "plan",
+      "timestamp": "2026-05-13T19:05:33Z",
+      "duration_ms": 301882,
+      "cost_usd": 1.635043,
+      "result": "success",
+      "prompt_tokens": 1149053,
+      "completion_tokens": 18455,
+      "total_tokens": 1167508,
+      "session_mode": "persistent",
+      "session_id": "019e22b6-4740-7963-aef9-94767d19a8c3",
+      "agent": "codex",
+      "output_file": "plan_v1.md",
+      "artifact_hash": "sha256:1f053c65f3acef1d93f4f935bf28bd7a2be66c7cdf67517d62e79fc5b453b350"
+    },
+    {
+      "step": "critique",
+      "timestamp": "2026-05-13T19:08:22Z",
+      "duration_ms": 167716,
+      "cost_usd": 1.105537,
+      "result": "success",
+      "prompt_tokens": 831887,
+      "completion_tokens": 9717,
+      "total_tokens": 841604,
+      "session_mode": "persistent",
+      "session_id": "019e22ba-e953-7583-8449-a1f717f5177d",
+      "agent": "codex",
+      "output_file": "critique_v1.json",
+      "artifact_hash": "sha256:19ad1f578dfd526fc0618007370fece202c68cf192a6f57ff72ca0c11013b197",
+      "flags_count": 14
+    },
+    {
+      "step": "gate",
+      "timestamp": "2026-05-13T19:08:41Z",
+      "duration_ms": 17464,
+      "cost_usd": 0.305441,
+      "result": "success",
+      "prompt_tokens": 59065,
+      "completion_tokens": 702,
+      "total_tokens": 59767,
+      "session_mode": "persistent",
+      "session_id": "019e22bd-7ee1-7c80-be5f-d9fd2ed6741a",
+      "agent": "codex",
+      "output_file": "gate.json",
+      "artifact_hash": "sha256:cb2f06d7cf5bc563ec788ea996d2dc6784f906b9613b0be8c41114f5215e3911",
+      "recommendation": "ITERATE"
+    },
+    {
+      "step": "revise",
+      "timestamp": "2026-05-13T19:12:17Z",
+      "duration_ms": 213833,
+      "cost_usd": 2.607663,
+      "result": "success",
+      "prompt_tokens": 1294359,
+      "completion_tokens": 29250,
+      "total_tokens": 1323609,
+      "session_mode": "persistent",
+      "session_id": "019e22b6-4740-7963-aef9-94767d19a8c3",
+      "agent": "codex",
+      "output_file": "plan_v2.md",
+      "artifact_hash": "sha256:e09580c0105e2667b6f17f27ac9c2d30782160c41d9fc292a1f062afdd10e17b",
+      "flags_addressed": [
+        "FLAG-001",
+        "FLAG-002",
+        "FLAG-003",
+        "issue_hints-1",
+        "issue_hints-2",
+        "correctness-1",
+        "correctness-2",
+        "scope",
+        "all_locations",
+        "callers-1",
+        "callers-2"
+      ]
+    },
+    {
+      "step": "critique",
+      "timestamp": "2026-05-13T19:14:24Z",
+      "duration_ms": 125204,
+      "cost_usd": 2.347012,
+      "result": "success",
+      "prompt_tokens": 1840610,
+      "completion_tokens": 16611,
+      "total_tokens": 1857221,
+      "session_mode": "persistent",
+      "session_id": "019e22ba-e953-7583-8449-a1f717f5177d",
+      "agent": "codex",
+      "output_file": "critique_v2.json",
+      "artifact_hash": "sha256:75598e53de7c38a2d1f01725e7611fba8ce14257d0cf3a790fd5bdbc6d53efdf",
+      "flags_count": 10
+    },
+    {
+      "step": "gate",
+      "timestamp": "2026-05-13T19:14:45Z",
+      "duration_ms": 19278,
+      "cost_usd": 0.69829,
+      "result": "success",
+      "prompt_tokens": 152198,
+      "completion_tokens": 1558,
+      "total_tokens": 153756,
+      "session_mode": "persistent",
+      "session_id": "019e22bd-7ee1-7c80-be5f-d9fd2ed6741a",
+      "agent": "codex",
+      "output_file": "gate.json",
+      "artifact_hash": "sha256:96940c0da43a7f3e16dcdad94f499a1a1d950eff60984d98573cd906f2e08bb5",
+      "recommendation": "ITERATE"
+    },
+    {
+      "step": "revise",
+      "timestamp": "2026-05-13T19:17:35Z",
+      "duration_ms": 168304,
+      "cost_usd": 3.172958,
+      "result": "success",
+      "prompt_tokens": 1476886,
+      "completion_tokens": 39464,
+      "total_tokens": 1516350,
+      "session_mode": "persistent",
+      "session_id": "019e22b6-4740-7963-aef9-94767d19a8c3",
+      "agent": "codex",
+      "output_file": "plan_v3.md",
+      "artifact_hash": "sha256:a4e94347b88cdd42c7950303c7e59d657311209fd7beae9f1d71a3b20d4ffc8e",
+      "flags_addressed": [
+        "correctness-1",
+        "correctness-2",
+        "scope",
+        "FLAG-004",
+        "FLAG-005",
+        "issue_hints",
+        "callers"
+      ]
+    },
+    {
+      "step": "critique",
+      "timestamp": "2026-05-13T19:19:16Z",
+      "duration_ms": 99287,
+      "cost_usd": 3.162449,
+      "result": "success",
+      "prompt_tokens": 2838133,
+      "completion_tokens": 21500,
+      "total_tokens": 2859633,
+      "session_mode": "persistent",
+      "session_id": "019e22ba-e953-7583-8449-a1f717f5177d",
+      "agent": "codex",
+      "output_file": "critique_v3.json",
+      "artifact_hash": "sha256:c083fbd7ac39735f1d901d1a1e9eee8f5e1dc71d0de90f931c705c595b6e776e",
+      "flags_count": 7
+    },
+    {
+      "step": "gate",
+      "timestamp": "2026-05-13T19:19:38Z",
+      "duration_ms": 20392,
+      "cost_usd": 0.951988,
+      "result": "success",
+      "prompt_tokens": 280226,
+      "completion_tokens": 2635,
+      "total_tokens": 282861,
+      "session_mode": "persistent",
+      "session_id": "019e22bd-7ee1-7c80-be5f-d9fd2ed6741a",
+      "agent": "codex",
+      "output_file": "gate.json",
+      "artifact_hash": "sha256:a949d7a3f61e0957a6fb20b542f0df97f3dd7464b3ef28549a83c34e9f498b5b",
+      "recommendation": "ITERATE"
+    },
+    {
+      "step": "revise",
+      "timestamp": "2026-05-13T19:22:30Z",
+      "duration_ms": 170366,
+      "cost_usd": 3.752905,
+      "result": "success",
+      "prompt_tokens": 1697225,
+      "completion_tokens": 49394,
+      "total_tokens": 1746619,
+      "session_mode": "persistent",
+      "session_id": "019e22b6-4740-7963-aef9-94767d19a8c3",
+      "agent": "codex",
+      "output_file": "plan_v4.md",
+      "artifact_hash": "sha256:2231dc3030248323250a0959374d6eaa5eaacdab0ca722fcc74639420816aa0e",
+      "flags_addressed": [
+        "issue_hints",
+        "FLAG-006",
+        "FLAG-007",
+        "correctness"
+      ]
+    },
+    {
+      "step": "critique",
+      "timestamp": "2026-05-13T19:23:29Z",
+      "duration_ms": 57634,
+      "cost_usd": 3.798633,
+      "result": "success",
+      "prompt_tokens": 3640617,
+      "completion_tokens": 24466,
+      "total_tokens": 3665083,
+      "session_mode": "persistent",
+      "session_id": "019e22ba-e953-7583-8449-a1f717f5177d",
+      "agent": "codex",
+      "output_file": "critique_v4.json",
+      "artifact_hash": "sha256:725aad80233bc58ed8b601466816c51e3e329f977bce7879dec756d74aadc3a5",
+      "flags_count": 3
+    },
+    {
+      "step": "gate",
+      "timestamp": "2026-05-13T19:23:51Z",
+      "duration_ms": 20121,
+      "cost_usd": 1.212544,
+      "result": "success",
+      "prompt_tokens": 442406,
+      "completion_tokens": 3471,
+      "total_tokens": 445877,
+      "session_mode": "persistent",
+      "session_id": "019e22bd-7ee1-7c80-be5f-d9fd2ed6741a",
+      "agent": "codex",
+      "output_file": "gate.json",
+      "artifact_hash": "sha256:9326c4e76aeb3512087a988b25f3466c26f64bb8b86740ea26e3d46d2ee4deef",
+      "recommendation": "PROCEED"
+    },
+    {
+      "step": "finalize",
+      "timestamp": "2026-05-13T19:25:29Z",
+      "duration_ms": 94493,
+      "cost_usd": 0.464641,
+      "result": "success",
+      "prompt_tokens": 62111,
+      "completion_tokens": 5501,
+      "total_tokens": 67612,
+      "session_mode": "persistent",
+      "session_id": "019e22cb-a935-72d1-a29a-27d282186496",
+      "agent": "codex",
+      "output_file": "finalize.json",
+      "artifact_hash": "sha256:842ab1de7fc7c287f4ed8147cc6ab3a7d95b4c6c5907f47d5ff43c92a38aa857"
+    },
+    {
+      "step": "finalize",
+      "timestamp": "2026-05-13T19:28:20Z",
+      "duration_ms": 98668,
+      "cost_usd": 1.032935,
+      "result": "success",
+      "prompt_tokens": 163177,
+      "completion_tokens": 10883,
+      "total_tokens": 174060,
+      "session_mode": "persistent",
+      "session_id": "019e22cb-a935-72d1-a29a-27d282186496",
+      "agent": "codex",
+      "output_file": "finalize.json",
+      "artifact_hash": "sha256:9609604384587384176de2681598fe20f1487d2838dc3ce716c787fbb6c708fd"
+    },
+    {
+      "step": "execute",
+      "timestamp": "2026-05-13T20:54:34Z",
+      "duration_ms": 1057351,
+      "cost_usd": 23.883236000000004,
+      "result": "blocked",
+      "session_mode": "persistent",
+      "session_id": "019e230e-8d2c-7302-ba3d-dfefc9623980",
+      "agent": "codex",
+      "output_file": "execution.json",
+      "artifact_hash": "sha256:ab1b4fd5223082f088fa848f44ff2ca3f109b9a26869c76ccfda54f4c1b4a1b3",
+      "finalize_hash": "sha256:2b9ff4c181fb1f2c35ae2f8711fd60d369d5d7de596b35388b3dc9fde60af437",
+      "approval_mode": "auto_approve"
+    }
+  ],
+  "meta": {
+    "significant_counts": [
+      11,
+      7,
+      4,
+      0
+    ],
+    "weighted_scores": [
+      17.5,
+      13.0,
+      5.0,
+      0
+    ],
+    "plan_deltas": [
+      82.88,
+      23.5,
+      14.07
+    ],
+    "recurring_critiques": [
+      [],
+      [],
+      [],
+      []
+    ],
+    "total_cost_usd": 50.131275,
+    "overrides": [],
+    "notes": [],
+    "current_invocation_id": "3631d5aef63a403c",
+    "user_approved_gate": true
+  },
+  "last_gate": {
+    "recommendation": "PROCEED",
+    "rationale": "Execution should move forward. The plan now resolves the capacity-budgeting, lock-scope, shadow-row, route-backoff, excluded-worker, idempotency, and rollout-slice issues. Remaining concerns are either captured as validation criteria or runtime gates rather than plan blockers.",
+    "reprompted": false,
+    "signals_assessment": "The score trajectory is strong: 17.5 -> 13.0 -> 5.0 -> 0. All significant flags are resolved, there are no unresolved blockers, and preflight is clean: the project directory exists, is writable, success criteria are present, and required agents/tools are available. The plan delta has tapered from 82.9% to 14.1%, which suggests the plan has converged rather than churned.",
+    "warnings": [
+      "During implementation, keep the shadow/authoritative distinction sharp: exact-one-row applies to authoritative mode only, while shadow rows require observer metadata and dedupe-aware audit queries.",
+      "Verify the migration actually enforces `worker_capacity_route_backoffs.route_key NOT NULL` and `PRIMARY KEY (pool, route_key)` with `__pool_floor__` normalization before any DB access.",
+      "Do not let the final cleanup gates apply to the initial shadow slice; deletion of `_handle_early_termination` and `control/phases/` belongs to the final cleanup slice."
+    ],
+    "settled_decisions": [
+      {
+        "id": "pool_scoped_capacity",
+        "decision": "Capacity planning, min/max bounds, idle buffer, and authoritative locking are pool-scoped.",
+        "rationale": "The repository config exposes pool/orchestrator-level capacity limits, so route keys must not create independent capacity budgets."
+      },
+      {
+        "id": "route_scoped_backoff",
+        "decision": "Route keys are used for demand attribution, audit, and `(pool, route_key)` spawn backoff inside the pool budget.",
+        "rationale": "This preserves per-route RunPod failure isolation without overprovisioning the pool."
+      },
+      {
+        "id": "non_null_pool_floor_route_key",
+        "decision": "Use `__pool_floor__` as the non-null sentinel for pool-floor/buffer spawn backoff rows.",
+        "rationale": "PostgreSQL can then enforce uniqueness with `PRIMARY KEY (pool, route_key)` without nullable-key ambiguity."
+      },
+      {
+        "id": "three_slice_rollout",
+        "decision": "Ship as shadow, authoritative cutover, then final cleanup slices with separate gates.",
+        "rationale": "This keeps production safety and rollback while still satisfying final deletion criteria after the observation window."
+      }
+    ],
+    "passed": true,
+    "preflight_results": {
+      "project_dir_exists": true,
+      "project_dir_writable": true,
+      "success_criteria_present": true,
+      "claude_available": true,
+      "codex_available": true
+    },
+    "orchestrator_guidance": "Plan passed gate and preflight. Proceed to finalize."
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "output": "Batch 5 complete. T4 added the capacity reconciler observation phase with selected-pool route demand attribution, excluded-worker preservation, route backoff reads, and focused observation tests.",
+  "files_changed": [
+    "gpu_orchestrator/control/capacity_types.py",
+    "gpu_orchestrator/control/capacity_reconciler.py",
+    "tests/gpu_orchestrator/control/test_capacity_reconciler_observe.py",
+    ".megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_5.json"
+  ],
+  "commands_run": [
+    "python -m pytest tests/gpu_orchestrator/control/test_capacity_reconciler_observe.py -q",
+    "python -m pytest tests/gpu_orchestrator/control -q",
+    "python -m pytest tests/gpu_orchestrator/test_route_aware_task_counts.py -q",
+    "python -m py_compile gpu_orchestrator/control/capacity_reconciler.py gpu_orchestrator/control/capacity_types.py",
+    "python -m pytest --tb=no -q --no-header",
+    "python -m pytest tests/test_module_import_coverage.py -q",
+    "jq -e . .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_5.json >/dev/null"
+  ],
+  "deviations": [
+    "Full suite still fails only at `tests/test_module_import_coverage.py::test_runpod_cutover_modules_import_at_runtime` because `scripts.spot_instance_lifetime_test` is missing. This was already observed in prior batches and is unrelated to T4.",
+    "Advisory quality: gpu_orchestrator/control/capacity_reconciler.py grew by 268 lines (threshold 200).",
+    "Advisory quality: tests/gpu_orchestrator/control/test_capacity_reconciler_observe.py grew by 258 lines (threshold 200).",
+    "Advisory observation mismatch: executor claimed files not observed in git status/content hash delta: .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_5.json",
+    "Advisory audit finding: Git status shows changed files not claimed by any task: .megaplan/debt.json, .megaplan/plans/capacity-reconciler-20260513/, .megaplan/schemas/feedback.json, .megaplan/schemas/finalize.json, .megaplan/schemas/review.json, .megaplan/schemas/revise.json",
+    "Advisory audit finding: Sense check SC5 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC6 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC7 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC8 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC9 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC10 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC11 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC12 is missing an executor acknowledgment.",
+    "Advisory audit finding: Tasks left pending after execute (executor never started them): T5, T6, T7, T8, T9, T10, T11, T12"
+  ],
+  "task_updates": [
+    {
+      "task_id": "T4",
+      "status": "done",
+      "executor_notes": "Added `gpu_orchestrator/control/capacity_reconciler.py` observation support and extended `ObservedPoolState` with excluded-worker and route-demand provenance fields. Observation reads workers and task counts once, preserves the `partition_capacity_workers()` boundary by excluding live-test/harness workers from capacity derivation while returning them in `excluded_workers`, derives selected-pool route demand from exact `route_totals`, safely infers single-route selected totals, falls back to an explicit `__unattributed_route__` demand instead of `__pool_floor__` when route attribution is ambiguous, applies route-scoped backoff reads, derives worker snapshots from production workers only, and counts only included non-terminal non-route-stale active/spawning workers as effective capacity. Added `tests/gpu_orchestrator/control/test_capacity_reconciler_observe.py` covering excluded workers, exact/inferred/fallback route demand, worker metadata route attribution, route backoff suppression, and route-stale effective-capacity exclusion. Verified with focused observation tests, the full `tests/gpu_orchestrator/control` module, route-aware task count tests, and py_compile. Full suite was run and failed only at the already observed missing `scripts.spot_instance_lifetime_test` import, unrelated to T4.",
+      "files_changed": [
+        "gpu_orchestrator/control/capacity_types.py",
+        "gpu_orchestrator/control/capacity_reconciler.py",
+        "tests/gpu_orchestrator/control/test_capacity_reconciler_observe.py",
+        ".megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_5.json"
+      ],
+      "commands_run": [
+        "python -m pytest tests/gpu_orchestrator/control/test_capacity_reconciler_observe.py -q",
+        "python -m pytest tests/gpu_orchestrator/control -q",
+        "python -m pytest tests/gpu_orchestrator/test_route_aware_task_counts.py -q",
+        "python -m py_compile gpu_orchestrator/control/capacity_reconciler.py gpu_orchestrator/control/capacity_types.py",
+        "python -m pytest --tb=no -q --no-header",
+        "python -m pytest tests/test_module_import_coverage.py -q",
+        "jq -e . .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_5.json >/dev/null"
+      ],
+      "auto_attributed_files": false
+    }
+  ],
+  "sense_check_acknowledgments": [
+    {
+      "sense_check_id": "SC4",
+      "executor_note": "Yes. Observation partitions live-test/harness workers out before derivation and capacity counts while returning them through `excluded_workers` for cleanup visibility. Route demand handles exact selected `route_totals`, safe single-route inference from selected-pool totals, explicit unattributed fallback for ambiguous selected totals, and route-scoped backoff reads without using `__pool_floor__` for observed demand."
+    }
+  ]
+}

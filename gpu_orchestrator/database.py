@@ -16,6 +16,45 @@ logger = logging.getLogger(__name__)
 # Max worker IDs per .in_() filter to stay within PostgREST URL length limits.
 # Worker IDs are ~40 chars; 10 keeps the query well under the limit.
 _IN_CHUNK_SIZE = 10
+CAPACITY_POOL_FLOOR_ROUTE_KEY = "__pool_floor__"
+
+
+def normalize_capacity_route_key(route_key: Optional[str]) -> str:
+    """Normalize nullable pool-floor route keys for capacity backoff rows."""
+
+    if route_key is None or str(route_key).strip() == "":
+        return CAPACITY_POOL_FLOOR_ROUTE_KEY
+    return str(route_key)
+
+
+def _isoformat_or_none(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).isoformat()
+    return value
+
+
+def _first_row(data: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(data, list):
+        return data[0] if data else None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def _capacity_worker_metadata(
+    *,
+    capacity_intent_id: Optional[str] = None,
+    capacity_action_ordinal: Optional[int] = None,
+    spawn_reason_route_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {}
+    if capacity_intent_id is not None:
+        metadata["capacity_intent_id"] = str(capacity_intent_id)
+    if capacity_action_ordinal is not None:
+        metadata["capacity_action_ordinal"] = capacity_action_ordinal
+    if spawn_reason_route_key is not None:
+        metadata["spawn_reason_route_key"] = normalize_capacity_route_key(spawn_reason_route_key)
+    return metadata
 
 
 def _env_str(*names: str, default: str) -> str:
@@ -148,6 +187,353 @@ class DatabaseClient:
             raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set")
         
         self.supabase: Client = create_client(supabase_url, supabase_key)
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> Optional[datetime]:
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    # Capacity reconciler operations
+    async def insert_worker_capacity_intent(
+        self,
+        *,
+        pool: str,
+        desired_capacity: int,
+        reason: str,
+        route_key: Optional[str] = None,
+        observed_queued: Optional[int] = None,
+        observed_active: Optional[int] = None,
+        observed_spawning: Optional[int] = None,
+        observed_idle: Optional[int] = None,
+        observed_in_progress: Optional[int] = None,
+        observed_route_stale: Optional[int] = None,
+        effective_capacity: Optional[int] = None,
+        cycle_id: Optional[int] = None,
+        observer_id: Optional[str] = None,
+        observation_id: Optional[str] = None,
+        actions: Optional[List[Dict[str, Any]]] = None,
+        suppressed_actions: Optional[List[Dict[str, Any]]] = None,
+        outcome: Optional[Dict[str, Any]] = None,
+        valid_until: Optional[datetime] = None,
+        stable_since: Optional[datetime] = None,
+        consecutive_spawn_failures: int = 0,
+        next_spawn_allowed_at: Optional[datetime] = None,
+        shadow: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Insert one durable capacity intent row for a reconciler cycle."""
+
+        payload = {
+            "pool": pool,
+            "route_key": route_key,
+            "desired_capacity": desired_capacity,
+            "reason": reason,
+            "observed_queued": observed_queued,
+            "observed_active": observed_active,
+            "observed_spawning": observed_spawning,
+            "observed_idle": observed_idle,
+            "observed_in_progress": observed_in_progress,
+            "observed_route_stale": observed_route_stale,
+            "effective_capacity": effective_capacity,
+            "cycle_id": cycle_id,
+            "observer_id": observer_id,
+            "observation_id": observation_id,
+            "actions": actions or [],
+            "suppressed_actions": suppressed_actions or [],
+            "outcome": outcome or {},
+            "valid_until": _isoformat_or_none(valid_until),
+            "stable_since": _isoformat_or_none(stable_since),
+            "consecutive_spawn_failures": consecutive_spawn_failures,
+            "next_spawn_allowed_at": _isoformat_or_none(next_spawn_allowed_at),
+            "shadow": shadow,
+        }
+        payload = {key: value for key, value in payload.items() if value is not None}
+
+        try:
+            result = self.supabase.table("worker_capacity_intents").insert(payload).execute()
+            return _first_row(result.data)
+        except Exception as e:
+            logger.error(f"Failed to insert worker capacity intent for pool {pool}: {e}")
+            return None
+
+    async def update_worker_capacity_intent_outcome(
+        self,
+        intent_id: str,
+        *,
+        outcome: Optional[Dict[str, Any]] = None,
+        actions: Optional[List[Dict[str, Any]]] = None,
+        suppressed_actions: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        """Update post-action outcome details for an existing capacity intent."""
+
+        payload: Dict[str, Any] = {"updated_at": datetime.now(timezone.utc).isoformat()}
+        if outcome is not None:
+            payload["outcome"] = outcome
+        if actions is not None:
+            payload["actions"] = actions
+        if suppressed_actions is not None:
+            payload["suppressed_actions"] = suppressed_actions
+
+        try:
+            self.supabase.table("worker_capacity_intents").update(payload).eq("id", intent_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update worker capacity intent {intent_id}: {e}")
+            return False
+
+    async def get_latest_authoritative_capacity_intent(
+        self,
+        pool: str,
+        route_key: Optional[str] = None,
+        *,
+        limit: int = 1,
+    ) -> Optional[Dict[str, Any]]:
+        """Read the latest authoritative intent for a pool, optionally route-scoped."""
+
+        try:
+            query = (
+                self.supabase.table("worker_capacity_intents")
+                .select("*")
+                .eq("pool", pool)
+                .eq("shadow", False)
+                .order("created_at", desc=True)
+                .limit(limit)
+            )
+            if route_key is not None:
+                query = query.eq("route_key", route_key)
+            result = query.execute()
+            return _first_row(result.data)
+        except Exception as e:
+            logger.error(f"Failed to read latest authoritative capacity intent for pool {pool}: {e}")
+            return None
+
+    async def get_shadow_capacity_observations(
+        self,
+        *,
+        pool: Optional[str] = None,
+        observer_id: Optional[str] = None,
+        observation_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Read shadow-mode capacity observations for audit/dedupe surfaces."""
+
+        try:
+            query = (
+                self.supabase.table("worker_capacity_intents")
+                .select("*")
+                .eq("shadow", True)
+                .order("created_at", desc=True)
+                .limit(limit)
+            )
+            if pool is not None:
+                query = query.eq("pool", pool)
+            if observer_id is not None:
+                query = query.eq("observer_id", observer_id)
+            if observation_id is not None:
+                query = query.eq("observation_id", observation_id)
+            result = query.execute()
+            return result.data or []
+        except Exception as e:
+            logger.error(f"Failed to read shadow capacity observations: {e}")
+            return []
+
+    async def acquire_pool_lease(
+        self,
+        *,
+        pool: str,
+        holder_id: str,
+        ttl_seconds: int,
+        lease_key: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Acquire or renew a TTL lease for a pool when absent, expired, or already held."""
+
+        now_dt = now or datetime.now(timezone.utc)
+        key = lease_key or f"capacity:{pool}"
+        expires_at = now_dt + timedelta(seconds=ttl_seconds)
+        payload = {
+            "lease_key": key,
+            "pool": pool,
+            "holder_id": holder_id,
+            "acquired_at": now_dt.isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "metadata": metadata or {},
+        }
+
+        try:
+            existing = (
+                self.supabase.table("orchestrator_leases")
+                .select("*")
+                .eq("lease_key", key)
+                .limit(1)
+                .execute()
+            )
+            row = _first_row(existing.data)
+            if row:
+                existing_expires = self._parse_datetime(row.get("expires_at"))
+                existing_holder = row.get("holder_id")
+                if existing_holder != holder_id and existing_expires and existing_expires > now_dt:
+                    return False
+                self.supabase.table("orchestrator_leases").update(payload).eq("lease_key", key).execute()
+                return True
+
+            self.supabase.table("orchestrator_leases").insert(payload).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to acquire pool lease {key}: {e}")
+            return False
+
+    async def release_pool_lease(
+        self,
+        *,
+        pool: str,
+        holder_id: str,
+        lease_key: Optional[str] = None,
+    ) -> bool:
+        """Release a pool lease only for the holder that owns it."""
+
+        key = lease_key or f"capacity:{pool}"
+        try:
+            self.supabase.table("orchestrator_leases").delete().eq("lease_key", key).eq("holder_id", holder_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to release pool lease {key}: {e}")
+            return False
+
+    async def get_route_backoff(self, pool: str, route_key: Optional[str] = None) -> Dict[str, Any]:
+        """Read route-scoped spawn backoff state, returning a default row if absent."""
+
+        normalized_route_key = normalize_capacity_route_key(route_key)
+        default = {
+            "pool": pool,
+            "route_key": normalized_route_key,
+            "consecutive_spawn_failures": 0,
+            "next_spawn_allowed_at": None,
+        }
+        try:
+            result = (
+                self.supabase.table("worker_capacity_route_backoffs")
+                .select("*")
+                .eq("pool", pool)
+                .eq("route_key", normalized_route_key)
+                .limit(1)
+                .execute()
+            )
+            return _first_row(result.data) or default
+        except Exception as e:
+            logger.error(f"Failed to read route backoff for {pool}/{normalized_route_key}: {e}")
+            return default
+
+    async def record_route_spawn_failure(
+        self,
+        pool: str,
+        route_key: Optional[str] = None,
+        *,
+        error: Optional[str] = None,
+        now: Optional[datetime] = None,
+        base_delay_seconds: int = 30,
+        max_delay_seconds: int = 600,
+    ) -> Dict[str, Any]:
+        """Increment route backoff and compute the next spawn cooldown."""
+
+        now_dt = now or datetime.now(timezone.utc)
+        current = await self.get_route_backoff(pool, route_key)
+        failures = int(current.get("consecutive_spawn_failures") or 0) + 1
+        delay_seconds = min((2 ** (failures - 1)) * base_delay_seconds, max_delay_seconds)
+        next_allowed = now_dt + timedelta(seconds=delay_seconds)
+        payload = {
+            "pool": pool,
+            "route_key": normalize_capacity_route_key(route_key),
+            "consecutive_spawn_failures": failures,
+            "next_spawn_allowed_at": next_allowed.isoformat(),
+            "last_spawn_failed_at": now_dt.isoformat(),
+            "last_error": error,
+            "updated_at": now_dt.isoformat(),
+        }
+        payload = {key: value for key, value in payload.items() if value is not None}
+
+        try:
+            result = (
+                self.supabase.table("worker_capacity_route_backoffs")
+                .upsert(payload, on_conflict="pool,route_key")
+                .execute()
+            )
+            return _first_row(result.data) or payload
+        except Exception as e:
+            logger.error(f"Failed to update route spawn failure for {pool}/{payload['route_key']}: {e}")
+            return payload
+
+    async def reset_route_backoff(
+        self,
+        pool: str,
+        route_key: Optional[str] = None,
+        *,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Reset route backoff after a successful pod creation for that route."""
+
+        now_dt = now or datetime.now(timezone.utc)
+        payload = {
+            "pool": pool,
+            "route_key": normalize_capacity_route_key(route_key),
+            "consecutive_spawn_failures": 0,
+            "next_spawn_allowed_at": None,
+            "last_spawn_succeeded_at": now_dt.isoformat(),
+            "updated_at": now_dt.isoformat(),
+        }
+        try:
+            self.supabase.table("worker_capacity_route_backoffs").upsert(
+                payload,
+                on_conflict="pool,route_key",
+            ).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to reset route backoff for {pool}/{payload['route_key']}: {e}")
+            return False
+
+    async def insert_system_log_metadata(
+        self,
+        *,
+        source_id: str,
+        message: str,
+        metadata: Dict[str, Any],
+        log_level: str = "INFO",
+        source_type: str = "orchestrator_gpu",
+        task_id: Optional[str] = None,
+        worker_id: Optional[str] = None,
+        cycle_number: Optional[int] = None,
+        timestamp: Optional[datetime] = None,
+    ) -> bool:
+        """Insert one root-level system_logs row with caller-supplied metadata."""
+
+        payload = {
+            "timestamp": _isoformat_or_none(timestamp) or datetime.now(timezone.utc).isoformat(),
+            "source_type": source_type,
+            "source_id": source_id,
+            "log_level": log_level,
+            "message": message,
+            "task_id": task_id,
+            "worker_id": worker_id,
+            "cycle_number": cycle_number,
+            "metadata": metadata,
+        }
+        payload = {key: value for key, value in payload.items() if value is not None}
+        try:
+            self.supabase.table("system_logs").insert(payload).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to insert system log metadata: {e}")
+            return False
     
     # Task operations (minimal - most task management is done by headless workers)
     async def count_available_tasks_via_edge_function(self, include_active: bool = True) -> int:
@@ -352,16 +738,77 @@ class DatabaseClient:
         except Exception as e:
             logger.error(f"Failed to get worker {worker_id}: {e}")
             return None
+
+    async def get_worker_by_capacity_action(
+        self,
+        capacity_intent_id: str,
+        capacity_action_ordinal: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Find a worker created for a specific reconciler intent action."""
+
+        try:
+            result = (
+                self.supabase.table("workers")
+                .select("*")
+                .eq("metadata->>capacity_intent_id", str(capacity_intent_id))
+                .eq("metadata->>capacity_action_ordinal", str(capacity_action_ordinal))
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            worker = _first_row(result.data)
+            if not worker:
+                return None
+
+            metadata = worker.get("metadata") or {}
+            return {
+                "id": worker["id"],
+                "instance_type": worker["instance_type"],
+                "status": worker["status"],
+                "created_at": worker["created_at"],
+                "last_heartbeat": worker.get("last_heartbeat"),
+                "metadata": metadata,
+            }
+        except Exception as e:
+            logger.error(
+                "Failed to get worker for capacity intent %s action %s: %s",
+                capacity_intent_id,
+                capacity_action_ordinal,
+                e,
+            )
+            return None
     
-    async def create_worker_record(self, worker_id: str, instance_type: str, runpod_id: str = None) -> bool:
+    async def create_worker_record(
+        self,
+        worker_id: str,
+        instance_type: str,
+        runpod_id: str = None,
+        *,
+        capacity_intent_id: Optional[str] = None,
+        capacity_action_ordinal: Optional[int] = None,
+        spawn_reason_route_key: Optional[str] = None,
+        metadata_update: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Create a new worker record (optimistic registration)."""
         try:
             metadata = {
                 'orchestrator_status': 'spawning',
                 **selected_pool_route_metadata(),
+                **_capacity_worker_metadata(
+                    capacity_intent_id=capacity_intent_id,
+                    capacity_action_ordinal=capacity_action_ordinal,
+                    spawn_reason_route_key=spawn_reason_route_key,
+                ),
             }
             if runpod_id:
                 metadata['runpod_id'] = runpod_id
+            if (
+                (capacity_intent_id is not None or capacity_action_ordinal is not None)
+                and "spawn_reason_route_key" not in metadata
+            ):
+                metadata["spawn_reason_route_key"] = normalize_capacity_route_key(spawn_reason_route_key)
+            if metadata_update:
+                metadata.update(metadata_update)
             
             self.supabase.table('workers').insert({
                 'id': worker_id,

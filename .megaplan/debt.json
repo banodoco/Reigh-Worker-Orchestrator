@@ -33,6 +33,312 @@
       "resolved": false,
       "resolved_by": null,
       "resolved_at": null
+    },
+    {
+      "id": "DEBT-003",
+      "subsystem": "deploy-pre-flight",
+      "concern": "pre-flight checklist is process-only, not ci-enforced.",
+      "flag_ids": [
+        "issue_hints-1"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-004",
+      "subsystem": "review-gate",
+      "concern": "codeowners team handle is a placeholder until operator confirms.",
+      "flag_ids": [
+        "all_locations-1"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-005",
+      "subsystem": "deploy-validation",
+      "concern": "railway-specific failures only tested at staging deploy time.",
+      "flag_ids": [
+        "all_locations-3"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-006",
+      "subsystem": "migration-runner",
+      "concern": "bootstrap proxy is a one-bit signal; partial-backup edge case not handled.",
+      "flag_ids": [
+        "correctness-2"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-007",
+      "subsystem": "did-the-work-fully-address-the-issue-hints-user-notes-and-approved-plan-requirements",
+      "concern": "did the work fully address the issue hints, user notes, and approved plan requirements?: plan structure warnings from validator say 'each step section should include at least one numbered substep' and 'each step section should reference at least one file in backticks'. several v4 step sections (step 6, step 7, step 9, step 10, step 11, step 12, step 13, step 14, step 16, step 17) say only 'identical to v3 step n' without re-listing substeps or files, which is what triggered the validator warnings. the plan is harder to execute standalone if the executor doesn't have v3 in front of them. process-level concern; doesn't change correctness.",
+      "flag_ids": [
+        "issue_hints-2"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-008",
+      "subsystem": "did-the-work-fully-address-the-issue-hints-user-notes-and-approved-plan-requirements",
+      "concern": "did the work fully address the issue hints, user notes, and approved plan requirements?: brief phase b item 2 makes the captured-incident replay (test f) the non-negotiable proof of correctness. plan step 10 explicitly synthesizes the fixture from the postmortem shape unless a real snapshot is provided, weakening the gate signal at cutover.",
+      "flag_ids": [
+        "issue_hints-3"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-009",
+      "subsystem": "did-the-work-fully-address-the-issue-hints-user-notes-and-approved-plan-requirements",
+      "concern": "did the work fully address the issue hints, user notes, and approved plan requirements?: invariant 7 (record() before any spawn side effect) combined with the plan's unique (pool, cycle_id) constraint and step 6's append-only insert-based backoff updates contradict each other: a second insert for the same (pool, cycle_id) after a runpod failure violates the unique constraint, so the backoff-state update path cannot land in production as written. constraint must be relaxed or backoff state must live in a separate table.",
+      "flag_ids": [
+        "issue_hints-4"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-010",
+      "subsystem": "are-the-proposed-changes-technically-correct",
+      "concern": "are the proposed changes technically correct?: psycopg3 cursor.execute(sql_text) does support multi-statement strings when no parameters are passed, but the plan should test against a `do $$ ... end $$;` block to confirm psycopg3's multi-statement handling preserves pl/pgsql block boundaries. test m's coverage (step 15) should include a fixture file with a do block to verify, not just create table / create function.",
+      "flag_ids": [
+        "correctness-3"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-011",
+      "subsystem": "are-the-proposed-changes-technically-correct",
+      "concern": "are the proposed changes technically correct?: backoff reset condition: invariant 5 says 'successful spawn for that (pool, route_key) resets the counter to 0.' plan step 5.1 defines consecutive_spawn_failures as 'count of consecutive failures since the most recent successful promotion-to-active for (pool, route_key).' that's a different signal \u2014 a worker's spawn-attempt succeeds when the pod is created (current spawn_failed surface), but 'promotion to active' is the lifecycle completion. these are minutes apart. the brief's reset condition wants reset-on-successful-pod-creation; the plan's wants reset-on-promotion-to-active, which delays reset and overcounts failures during the initialization window. probably the planner's choice is better (more conservative), but the deviation from the brief should be acknowledged.",
+      "flag_ids": [
+        "correctness-4"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-012",
+      "subsystem": "are-the-proposed-changes-technically-correct",
+      "concern": "are the proposed changes technically correct?: authoritative-mode active-scale-down still consults the legacy desired formula via _execute_scaling.max_by_capacity = decision.workers_to_terminate, derived from worker_state.py:616-627's legacy desired = max(min_based, task_based, buffer_based). this is one of the two conflicting formulas the brief identifies as root cause. plan should justify or replace the input.",
+      "flag_ids": [
+        "correctness-5"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-013",
+      "subsystem": "are-the-proposed-changes-technically-correct",
+      "concern": "are the proposed changes technically correct?: shadow admit exercises stale backoff state. step 5 says shadow act() must not update backoff state, but admit still consults next_spawn_allowed_at. with no shadow-side backoff state, suppression decisions never appear pre-cutover; brief's '>=50 meaningful capacity events including backoff suppressions' becomes structurally unobservable.",
+      "flag_ids": [
+        "correctness-6"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-014",
+      "subsystem": "search-for-related-code-that-handles-the-same-concept-is-the-reported-issue-a-symptom-of-something-broader",
+      "concern": "search for related code that handles the same concept. is the reported issue a symptom of something broader?: the new auto-discovery migration runner now spans the entire repo's sql/ directory, not just the four files in this pr. this widens the implicit contract: any future sql file dropped into sql/ will be auto-applied at next deploy, including files added by other prs or merge conflicts that an operator might miss. existing manually-driven workflow (supabase sql editor copy-paste) had a human gatekeeper. the plan does not propose a review checklist or pr-template gate around new sql/ files. minor process risk worth surfacing.",
+      "flag_ids": [
+        "scope"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-015",
+      "subsystem": "does-the-change-touch-all-locations-and-supporting-infrastructure",
+      "concern": "does the change touch all locations and supporting infrastructure?: the proxy `system_logs` table-exists check (step 2.4) is the only signal distinguishing established from fresh db. a staging db that was hand-spun for ci may have system_logs (from earlier manual provisioning) but not the other five tables, leading the bootstrap to skip migrations the staging db still needs. plan's test m coverage is good for the runner logic but not for the db-state variations. worth flagging.",
+      "flag_ids": [
+        "all_locations-2"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-016",
+      "subsystem": "find-the-callers-of-the-changed-function-what-arguments-do-they-actually-pass-does-the-fix-handle-all-of-them",
+      "concern": "find the callers of the changed function. what arguments do they actually pass? does the fix handle all of them?: step 9 says spawn_one_worker takes an optional intent_row_id and writes it under workers.metadata. the existing _spawn_worker builds a metadata dict at control_loop.py:1392-1404 with fields including runpod_id, termination_reason on failure, ssh_details, etc. the plan should call out that the new field is additive and doesn't collide with these keys, and that the worker creation path (db.create_worker_record at control_loop.py:1376) accepts the metadata at the right point.",
+      "flag_ids": [
+        "callers-1"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-017",
+      "subsystem": "find-the-callers-of-the-changed-function-what-arguments-do-they-actually-pass-does-the-fix-handle-all-of-them",
+      "concern": "find the callers of the changed function. what arguments do they actually pass? does the fix handle all of them?: reconciler's act() in authoritative mode calls runpod.terminate_worker(runpod_id) for cancelpendingspawn. existing caller in control_loop.py:410 wraps this with metadata update + summary.workers_terminated += 1. the plan describes equivalent metadata update in step 5.4 but doesn't address the summary/stats integration \u2014 cyclesummary fields like workers_terminated, workers_spawned are read by health_monitor and structured logs. if the reconciler bypasses the summary, those counters under-report.",
+      "flag_ids": [
+        "callers-2"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-018",
+      "subsystem": "find-the-callers-of-the-changed-function-what-arguments-do-they-actually-pass-does-the-fix-handle-all-of-them",
+      "concern": "find the callers of the changed function. what arguments do they actually pass? does the fix handle all of them?: reconciler's cancelpendingspawn db update uses `db.update_worker_status(worker_id, 'terminated', {'termination_reason': 'reconciler_cancel_pending_spawn', 'terminated_at': ..., 'intent_row_id': ...})`. existing equivalent in control_loop.py:416-420 also calls `await self.runpod.terminate_worker(ws.runpod_id)` before `db.update_worker_status`. v4 step 8.5 mirrors this ordering. the plan doesn't address what happens if runpod.terminate_worker fails \u2014 the existing code at control_loop.py:413-414 logs a warning and proceeds with the db update anyway. the reconciler should match that resilience pattern; plan should make this explicit so the executor doesn't accidentally abort the cycle on runpod terminate failure.",
+      "flag_ids": [
+        "callers"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-019",
+      "subsystem": "search-for-related-code-that-handles-the-same-concept-is-the-reported-issue-a-symptom-of-something-broader",
+      "concern": "search for related code that handles the same concept. is the reported issue a symptom of something broader?: codeowners entry is added with placeholder team `@banodoco/orchestrator`. if that team doesn't exist in github (verified: no .github/ directory in the repo at all \u2014 neither codeowners nor pull_request_template.md), the entry has no effect \u2014 github silently ignores rules referencing non-existent teams. plan acknowledges via question 1 that the executor will use a placeholder, but the gate is only as strong as the team handle being correct.",
+      "flag_ids": [
+        "scope-1"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
+    },
+    {
+      "id": "DEBT-020",
+      "subsystem": "search-for-related-code-that-handles-the-same-concept-is-the-reported-issue-a-symptom-of-something-broader",
+      "concern": "search for related code that handles the same concept. is the reported issue a symptom of something broader?: plan does not add .github/pull_request_template.md (step 4.2 explicitly says 'only if it doesn't already exist'). confirmed via ls .github/ that no template exists. so the pr-template checklist item described in step 4.2 will not be added in this pr. phase 0's pre-flight checklist depends on the operator manually copy-pasting it into each pr description \u2014 there's no automation.",
+      "flag_ids": [
+        "scope-2"
+      ],
+      "plan_ids": [
+        "capacity-reconciler-20260513"
+      ],
+      "occurrence_count": 1,
+      "created_at": "2026-05-13T18:09:03Z",
+      "updated_at": "2026-05-13T18:09:03Z",
+      "resolved": false,
+      "resolved_by": null,
+      "resolved_at": null
     }
   ]
 }

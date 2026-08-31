@@ -1,48 +1,67 @@
 #!/usr/bin/env python3
-"""
-Display SQL migrations for manual execution in Supabase.
-"""
+"""Display registered SQL migrations for manual Supabase execution."""
+
+from __future__ import annotations
+
+import argparse
+import sys
 from pathlib import Path
 
-def show_migrations():
-    """Display all SQL migrations in order."""
-    print("🛠️  SQL Migrations for Existing Schema")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from scripts.sql_migrations import (
+    capacity_schema_verification_sql,
+    migration_paths,
+    project_root,
+    read_sql,
+)
+
+
+def show_migrations(*, include_capacity_verification: bool = True) -> None:
+    root = project_root()
+
+    print("SQL Migrations")
     print("=" * 60)
-    print("Copy and paste these SQL scripts into your Supabase SQL Editor")
-    print("Run them in order (1, 2, 3)")
-    
-    # Get the project root
-    project_root = Path(__file__).parent.parent
-    sql_dir = project_root / "sql"
-    
-    # Migration files in order
-    migration_files = [
-        "20250202000000_add_missing_columns.sql",
-        "20250202000001_create_rpc_functions_existing.sql", 
-        "20250202000002_create_monitoring_views_existing.sql"
-    ]
-    
-    for i, filename in enumerate(migration_files, 1):
-        filepath = sql_dir / filename
-        
-        if filepath.exists():
-            print(f"\n{'=' * 60}")
-            print(f"MIGRATION {i}: {filename.replace('.sql', '').replace('_', ' ').title()}")
-            print(f"File: {filepath.relative_to(project_root)}")
-            print(f"{'=' * 60}")
-            
-            with open(filepath, 'r') as f:
-                content = f.read()
-                print(content)
-            
-            print(f"\n{'=' * 60}")
-            print(f"END OF MIGRATION {i}")
-            print(f"{'=' * 60}")
-        else:
-            print(f"\n⚠️  Migration file not found: {filename}")
-    
-    print("\n🎉 After running all migrations, test with:")
-    print("   python3 scripts/test_supabase.py")
+    print("Copy these scripts into the Supabase SQL Editor and run them in order.")
+
+    for index, path in enumerate(migration_paths(), 1):
+        if not path.exists():
+            print(f"\nMissing migration file: {path.relative_to(root)}")
+            continue
+
+        print(f"\n{'=' * 60}")
+        print(f"MIGRATION {index}: {path.name}")
+        print(f"File: {path.relative_to(root)}")
+        print(f"{'=' * 60}")
+        print(read_sql(path))
+        print(f"\n{'=' * 60}")
+        print(f"END OF MIGRATION {index}")
+        print(f"{'=' * 60}")
+
+    if include_capacity_verification:
+        print(f"\n{'=' * 60}")
+        print("CAPACITY SCHEMA VERIFICATION")
+        print(f"{'=' * 60}")
+        print(capacity_schema_verification_sql())
+        print(f"\n{'=' * 60}")
+        print("END CAPACITY SCHEMA VERIFICATION")
+        print(f"{'=' * 60}")
+
+    print("\nAfter applying migrations, run:")
+    print("   python3 scripts/apply_sql_migrations.py --no-verify-capacity-schema")
+    print("or paste only the CAPACITY SCHEMA VERIFICATION block above to verify manually.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--no-capacity-verification",
+        action="store_true",
+        help="Do not print the capacity schema verification SQL block.",
+    )
+    args = parser.parse_args()
+    show_migrations(include_capacity_verification=not args.no_capacity_verification)
+
 
 if __name__ == "__main__":
-    show_migrations() 
+    main()

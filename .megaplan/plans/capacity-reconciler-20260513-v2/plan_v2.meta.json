@@ -1,0 +1,257 @@
+{
+  "version": 2,
+  "timestamp": "2026-05-13T19:12:17Z",
+  "hash": "sha256:e09580c0105e2667b6f17f27ac9c2d30782160c41d9fc292a1f062afdd10e17b",
+  "changes_summary": "Revised the plan to resolve the significant gate flags: route-key handling is now explicit and per-route, excluded workers remain outside capacity reconciliation, rollout is split into shadow/authoritative/final-cleanup slices with separate gates, lifecycle-before-capacity shadow ordering is no longer an open question, migration deployment is an explicit pre-deploy gate, spawn idempotency extends initial worker metadata, and pending-spawn cancellation has defined behavior when RunPod termination fails.",
+  "flags_addressed": [
+    "FLAG-001",
+    "FLAG-002",
+    "FLAG-003",
+    "issue_hints-1",
+    "issue_hints-2",
+    "correctness-1",
+    "correctness-2",
+    "scope",
+    "all_locations",
+    "callers-1",
+    "callers-2"
+  ],
+  "questions": [],
+  "success_criteria": [
+    {
+      "criterion": "The SQL migration creates `worker_capacity_intents` with the required columns/indexes and creates a TTL-based `orchestrator_leases` mechanism for authoritative single-writer control.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "Migration registration and schema verification are wired into existing migration scripts or documented release commands, and shadow mode is gated on verified schema presence.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff",
+        "run_shell"
+      ]
+    },
+    {
+      "criterion": "`CapacityReconciler` and supporting types/planning modules exist under `gpu_orchestrator/control/` and expose observe, plan, admit, pre-act record, act, and outcome record boundaries.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "The reconciler creates route-scoped observations and intent/backoff keys for `(pool, route_key)` when route keys are present, with `route_key=NULL` only as a logged fallback.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "Backoff on one route key does not suppress spawns for a different route key in the same pool.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "`excluded_from_capacity_control` workers are neither counted nor mutated by capacity reconciliation, while periodic cleanup still receives excluded workers through the existing cleanup path.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "The pure plan uses one desired-capacity formula with explicit precedence among min floor, queued coverage, and busy-worker idle buffer.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Shadow mode records intent rows and shadow system_logs metadata but does not call RunPod, mutate worker rows, update backoff state, or acquire authoritative leases.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "Shadow-mode control-loop ordering is post-lifecycle and pre-legacy-capacity, and this ordering is covered by tests.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "Authoritative mode records an admitted intent successfully before executing any spawn, cancellation, or termination side effect.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "Authoritative mode enforces single-writer behavior per `(pool, route_key)` so two reconciler instances cannot both execute side effects for the same key.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "RunPod spawn backoff is keyed by `(pool, route_key)` and tests verify 30s, 60s, 120s, 240s cooldowns plus reset on success using an injected fake clock.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Queued-zero replay/cycle tests prove a spawning worker is not cancelled merely because queued work momentarily drops to zero while active work remains in progress.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Cancel hysteresis tests verify cancellation only after the required wall-clock stability window across multiple snapshots or after `valid_until` elapses.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Route-stale workers are excluded from fresh-route effective capacity and covered by tests.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Cutover adoption tests prove pre-existing spawning workers with no prior authoritative intent are counted as capacity and not cancelled on first authoritative observe.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Spawn idempotency is implemented by tagging initial worker rows with `capacity_intent_id` and action ordinal before RunPod launch, and duplicate action replay does not double-spawn.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "`CancelPendingSpawn` attempts RunPod termination but marks the worker terminal with failure metadata even when RunPod termination fails, and this behavior is tested.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "The shadow, authoritative, and final cleanup slices each have explicit gates, and final deletion gates are not required for the initial shadow slice.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "`_handle_early_termination` is removed in the final cleanup state, and `rg \"_handle_early_termination\"` returns zero matches.",
+      "priority": "must",
+      "requires": [
+        "run_shell"
+      ]
+    },
+    {
+      "criterion": "`gpu_orchestrator/control/phases/` is removed in the final cleanup state and no production or test code imports `gpu_orchestrator.control.phases`.",
+      "priority": "must",
+      "requires": [
+        "run_shell",
+        "read_files"
+      ]
+    },
+    {
+      "criterion": "`reigh-app/scripts/debug.py scaling-audit` is extended to include `worker_capacity_intents`, route-key divergence, backoff state, and intent stability without breaking import/compile.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "run_shell"
+      ]
+    },
+    {
+      "criterion": "Targeted reconciler, scaling, route-stale, route-aware task-count, and excluded-worker tests pass.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "The full repository pytest suite passes after legacy phase tests are rewritten or removed.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "The final design keeps lifecycle probing, promotion, health checks, stale route draining, error cleanup, orphan task reconciliation, and periodic zombie/storage checks intact.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "The implementation avoids changing `system_logs.valid_source_type` and uses `orchestrator_gpu` with metadata tags for shadow intent logs.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "Capacity planning code remains mostly pure and is small enough to reason about without hidden database or RunPod calls in PLAN/ADMIT.",
+      "priority": "should",
+      "requires": [
+        "read_files",
+        "subjective_judgment"
+      ]
+    },
+    {
+      "criterion": "Divergence audit SQL is clear enough for operators to inspect shadow-vs-legacy behavior by `(pool, route_key)` over the last 24h.",
+      "priority": "should",
+      "requires": [
+        "read_files",
+        "subjective_judgment"
+      ]
+    },
+    {
+      "criterion": "Production effective utilization reaches at least 70% sustained over 24h after cutover with no user-task failures attributable to the new controller.",
+      "priority": "info",
+      "requires": [
+        "observe_runtime_logs"
+      ]
+    }
+  ],
+  "assumptions": [
+    "The architectural root cause remains the two-controller capacity loop; critique flags refine safety and rollout details rather than replacing the approach.",
+    "Route totals from the existing task-count response are available often enough to create route-scoped observations; when unavailable, the reconciler uses a clearly logged fallback rather than silently treating all capacity as pool-wide.",
+    "Boot-time Railway schema mutation is intentionally avoided; migration application and schema verification are pre-deploy gates before enabling shadow mode.",
+    "The rollout is intentionally split into shadow, authoritative cutover, and final cleanup slices. Final deletion acceptance criteria apply to the final cleanup slice, not the initial shadow slice.",
+    "A lease table is the authoritative single-writer mechanism because Supabase/PostgREST cannot hold advisory locks across RunPod side effects.",
+    "The app debug command touch remains limited to the sibling `reigh-app` scaling-audit command."
+  ],
+  "delta_from_previous_percent": 82.88,
+  "structure_warnings": []
+}

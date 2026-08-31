@@ -1,0 +1,68 @@
+{
+  "output": "Batch 3 complete. T2 added capacity database helpers and focused fake-Supabase coverage.",
+  "files_changed": [
+    "gpu_orchestrator/database.py",
+    "tests/gpu_orchestrator/test_database_capacity_helpers.py",
+    ".megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_3.json"
+  ],
+  "commands_run": [
+    "sed -n '1,260p' gpu_orchestrator/database.py",
+    "sed -n '260,620p' gpu_orchestrator/database.py",
+    "sed -n '620,980p' gpu_orchestrator/database.py",
+    "rg -n \"create_worker_record\\\\(\" . -g '*.py'",
+    "sed -n '1340,1425p' gpu_orchestrator/control_loop.py",
+    "sed -n '1425,1468p' gpu_orchestrator/control_loop.py",
+    "rg -n \"system_logs|insert_log|log.*database|func_insert_logs\" gpu_orchestrator/database.py gpu_orchestrator -g '*.py'",
+    "python -m pytest tests/gpu_orchestrator/test_database_capacity_helpers.py tests/scripts/test_sql_migrations.py -q",
+    "python -m py_compile gpu_orchestrator/database.py",
+    "python -m pytest tests/test_module_import_coverage.py -q",
+    "python -m pytest --tb=no -q --no-header",
+    "git diff -- gpu_orchestrator/database.py",
+    "git diff --no-index /dev/null tests/gpu_orchestrator/test_database_capacity_helpers.py || true",
+    "jq -e . .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_3.json >/dev/null && git status --short"
+  ],
+  "deviations": [
+    "`tests/test_module_import_coverage.py` and the full suite still fail only at `tests/test_module_import_coverage.py::test_runpod_cutover_modules_import_at_runtime` because `scripts.spot_instance_lifetime_test` is missing. This was already observed in batch 2 and is unrelated to T2.",
+    "Advisory quality: gpu_orchestrator/database.py grew by 447 lines (threshold 200).",
+    "Advisory quality: tests/gpu_orchestrator/test_database_capacity_helpers.py grew by 276 lines (threshold 200).",
+    "Advisory observation mismatch: executor claimed files not observed in git status/content hash delta: .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_3.json",
+    "Advisory audit finding: Git status shows changed files not claimed by any task: .megaplan/debt.json, .megaplan/plans/capacity-reconciler-20260513/, .megaplan/schemas/feedback.json, .megaplan/schemas/finalize.json, .megaplan/schemas/review.json, .megaplan/schemas/revise.json",
+    "Advisory audit finding: Sense check SC3 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC4 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC5 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC6 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC7 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC8 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC9 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC10 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC11 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC12 is missing an executor acknowledgment.",
+    "Advisory audit finding: Tasks left pending after execute (executor never started them): T3, T4, T5, T6, T7, T8, T9, T10, T11, T12"
+  ],
+  "task_updates": [
+    {
+      "task_id": "T2",
+      "status": "done",
+      "executor_notes": "Added capacity database helpers in `gpu_orchestrator/database.py`: intent insert and outcome update, latest authoritative intent read, shadow observation reads, TTL pool lease acquire/release, route backoff read/failure/reset with `__pool_floor__` normalization and reset-on-success semantics, direct root-level `system_logs` metadata insert, optional capacity metadata on `create_worker_record`, and worker lookup by `capacity_intent_id` plus `capacity_action_ordinal`. Existing `create_worker_record(worker_id, instance_type, runpod_id=None)` callers remain compatible because all capacity fields are keyword-only optional additions. Added `tests/gpu_orchestrator/test_database_capacity_helpers.py` with a fake Supabase client covering each helper surface. Verified with `python -m pytest tests/gpu_orchestrator/test_database_capacity_helpers.py tests/scripts/test_sql_migrations.py -q` and `python -m py_compile gpu_orchestrator/database.py`. Full suite was run with `python -m pytest --tb=no -q --no-header`; it failed only at the already observed `tests/test_module_import_coverage.py::test_runpod_cutover_modules_import_at_runtime` because `scripts.spot_instance_lifetime_test` is missing, unrelated to T2.",
+      "files_changed": [
+        "gpu_orchestrator/database.py",
+        "tests/gpu_orchestrator/test_database_capacity_helpers.py",
+        ".megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_3.json"
+      ],
+      "commands_run": [
+        "python -m pytest tests/gpu_orchestrator/test_database_capacity_helpers.py tests/scripts/test_sql_migrations.py -q",
+        "python -m py_compile gpu_orchestrator/database.py",
+        "python -m pytest tests/test_module_import_coverage.py -q",
+        "python -m pytest --tb=no -q --no-header",
+        "jq -e . .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_3.json >/dev/null"
+      ],
+      "auto_attributed_files": false
+    }
+  ],
+  "sense_check_acknowledgments": [
+    {
+      "sense_check_id": "SC2",
+      "executor_note": "Yes. The new `DatabaseClient` helpers cover intent pre-act insert and outcome update, authoritative and shadow intent reads, normalized route backoff read/update/reset, TTL pool lease acquire/release, direct `system_logs` insertion with root-level metadata, capacity metadata on worker creation, and idempotency lookup by capacity intent/action. Focused fake-Supabase tests exercise those surfaces without requiring live database state."
+    }
+  ]
+}

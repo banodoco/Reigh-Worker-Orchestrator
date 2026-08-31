@@ -26,6 +26,7 @@ def test_route_contract_config_defaults(monkeypatch: pytest.MonkeyPatch) -> None
     config = OrchestratorConfig.from_env()
 
     assert config.worker_backend == "wgp"
+    assert config.capacity_reconciler_mode == "off"
     assert config.worker_profile == "1"
     assert config.selector_namespace == "production"
     assert config.selector_version is None
@@ -60,4 +61,18 @@ def test_route_contract_config_rejects_unknown_backend(monkeypatch: pytest.Monke
     monkeypatch.setenv("REIGH_BACKEND", "comfy")
 
     with pytest.raises(ValueError, match="Unsupported worker backend"):
+        OrchestratorConfig.from_env()
+
+
+def test_capacity_reconciler_mode_parses_shadow_and_rejects_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ORCHESTRATOR_CAPACITY_RECONCILER_MODE", "shadow")
+
+    config = OrchestratorConfig.from_env()
+
+    assert config.capacity_reconciler_mode == "shadow"
+
+    monkeypatch.setenv("ORCHESTRATOR_CAPACITY_RECONCILER_MODE", "enabled")
+    with pytest.raises(ValueError, match="Unsupported ORCHESTRATOR_CAPACITY_RECONCILER_MODE"):
         OrchestratorConfig.from_env()

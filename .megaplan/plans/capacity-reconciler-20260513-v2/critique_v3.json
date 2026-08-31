@@ -1,0 +1,196 @@
+{
+  "checks": [
+    {
+      "id": "issue_hints",
+      "question": "Did the work fully address the issue hints, user notes, and approved plan requirements?",
+      "guidance": "Cross-check the result against explicit user notes, critique corrections, and watch items. Flag anything the implementation ignored, contradicted, or only partially covered.",
+      "findings": [
+        {
+          "detail": "Verified the prior route-intent audit-shape finding is addressed: the revised plan returns `worker_capacity_intents` to exactly one pool summary row per cycle and moves route-specific cooldown state into `worker_capacity_route_backoffs`, matching the brief's one-row-per-pool audit requirement while keeping `(pool, route_key)` backoff semantics.",
+          "flagged": false
+        },
+        {
+          "detail": "The plan still has a shadow-mode tension around the exact-one-row invariant. Step 8 says shadow mode does not acquire leases, Step 16 says shadow rows may need deduping across replicas, but success criteria also require exactly one `worker_capacity_intents` summary row per pool per cycle; with `cycle_count` local to each process in `control_loop.py`, multiple shadow replicas can write duplicate pool summary rows unless the criterion is narrowed to authoritative mode or the schema adds an idempotent shadow key.",
+          "flagged": true
+        }
+      ],
+      "prior_findings": [
+        {
+          "detail": "Verified the previous ordering and slice-gate findings are addressed in the revised plan: Step 13 explicitly reorders lifecycle handling before shadow observation and before legacy capacity actions, and Steps 14-15 define separate authoritative and final-cleanup gates so grep-zero deletion is not required for the initial shadow slice.",
+          "flagged": false,
+          "status": "n/a"
+        },
+        {
+          "detail": "The revised route-aware design diverges from the brief's stated audit shape of exactly one `worker_capacity_intents` row per cycle per pool. It now writes one intent per `(pool, route_key)` when route keys exist, which may be a justified correction for per-route backoff, but it should be treated as a plan/brief tension because downstream audit queries and the record-per-cycle invariant need to be rephrased around route-scoped rows.",
+          "flagged": true,
+          "status": "addressed"
+        }
+      ]
+    },
+    {
+      "id": "correctness",
+      "question": "Are the proposed changes technically correct?",
+      "guidance": "Look for logic errors, invalid assumptions, broken invariants, schema mismatches, or behavior that would fail at runtime. When the fix adds a conditional branch, check whether it handles all relevant cases \u2014 not just the one reported in the issue.",
+      "findings": [
+        {
+          "detail": "Verified the prior pool-budget and single-writer findings are addressed: Steps 7, 8, and 18 now compute one pool desired capacity, cap min/idle/max once, acquire a pool lease before authoritative side effects, and test that multiple route keys cannot multiply capacity or bypass the pool single-writer lock.",
+          "flagged": false
+        },
+        {
+          "detail": "The new `worker_capacity_route_backoffs` table is described as keyed by `(pool, route_key)` while also using `route_key=NULL` for pool-floor spawns. In PostgreSQL a nullable column cannot be part of a primary key, and a plain unique index on `(pool, route_key)` permits multiple `NULL` route-key rows, so the migration needs a sentinel key, expression index, or partial unique indexes to make the nullable fallback actually unique.",
+          "flagged": true
+        }
+      ],
+      "prior_findings": [
+        {
+          "detail": "Verified the previous null-route concern is mostly addressed: Steps 1, 4, 6, 16, and 18 now make route keys first-class and require a test proving backoff on `(pool, route_a)` does not suppress `(pool, route_b)`. The `route_key=NULL` path is now explicitly a logged fallback rather than the normal key.",
+          "flagged": false,
+          "status": "n/a"
+        },
+        {
+          "detail": "The new per-route planning formula applies pool-level `min_active_gpus`, `machines_to_keep_idle`, and `max_active_gpus` independently to every selected route. In this repo those values are loaded once in `gpu_orchestrator/config.py` as orchestrator/pool-wide limits, and existing tests show `selected_pool_totals.route_keys` can contain multiple routes, so two active routes could each plan up to `max_active_gpus` or each enforce the minimum floor and overprovision the pool.",
+          "flagged": true,
+          "status": "addressed"
+        },
+        {
+          "detail": "The revised single-writer design acquires leases by `(pool, route_key)`, but the brief's concurrency invariant is single-writer per pool and the current capacity limit is pool-wide. Two authoritative reconcilers holding different route leases in the same pool can both pass admission and RunPod side effects unless there is an additional pool-level budget/lease or aggregate cap check.",
+          "flagged": true,
+          "status": "addressed"
+        }
+      ]
+    },
+    {
+      "id": "scope",
+      "question": "Search for related code that handles the same concept. Is the reported issue a symptom of something broader?",
+      "guidance": "Look at how the changed function is used across the codebase. Does the fix only address one caller's scenario while others remain broken? Flag missing required work or out-of-scope edits. A minimal patch is often right, but check whether the underlying problem is bigger than what the issue describes.",
+      "findings": [
+        {
+          "detail": "Verified the route-metadata scope finding is addressed: the revised plan no longer requires worker route affinity for normal capacity math, treats existing workers without route-key metadata as valid pool capacity, and uses route keys only from task demand for spawn attribution and backoff.",
+          "flagged": false
+        },
+        {
+          "detail": "Checked related duplicate capacity paths with `rg`: the plan still targets production `control_loop.py` for integration and deletes the test-only `gpu_orchestrator/control/phases/` tree in the final cleanup slice, while leaving existing direct `calculate_scaling_decision_pure()` tests available until they are either kept as compatibility coverage or replaced. That scope remains consistent with the repository's current production entry point.",
+          "flagged": false
+        }
+      ],
+      "prior_findings": [
+        {
+          "detail": "Verified the previous excluded-worker finding is addressed: Step 5 explicitly preserves `partition_capacity_workers()`, excludes harness/live-test workers from effective and desired capacity, keeps periodic cleanup on the existing path, and adds an excluded spawning-worker test fixture.",
+          "flagged": false,
+          "status": "n/a"
+        },
+        {
+          "detail": "Checked route metadata in `gpu_orchestrator/worker_spawner.py` and `gpu_orchestrator/database.py`: selected worker metadata contains backend/profile/pool/selector/contract, while `route_key` currently appears in task-count route totals and some test fixtures, not in the normal worker environment or selected route metadata. The plan adds route-key handling in new helpers, which is in scope for the revised design, but it is a broader change than the original pool-level controller and needs the pool-budget guard called out in the correctness findings.",
+          "flagged": true,
+          "status": "addressed"
+        }
+      ]
+    },
+    {
+      "id": "all_locations",
+      "question": "Does the change touch all locations AND supporting infrastructure?",
+      "guidance": "Search for all instances of the symbol/pattern being changed. Also ask: does this feature require setup, registration, or integration code beyond the core logic? Missing glue code causes test failures even when the core fix is correct.",
+      "findings": [
+        {
+          "detail": "Checked the migration-supporting files again: `scripts/apply_sql_migrations.py` and `scripts/show_migrations.py` are still the relevant registration points, and the revised plan updates them plus schema verification for all three new objects (`worker_capacity_intents`, `worker_capacity_route_backoffs`, and `orchestrator_leases`). The absence of a Railway migration hook is explicitly handled as a pre-deploy gate rather than hidden runtime behavior.",
+          "flagged": false
+        },
+        {
+          "detail": "Checked `system_logs` and app debug requirements: the plan still preserves `source_type='orchestrator_gpu'` and extends the sibling `reigh-app` scaling-audit command for pool summaries plus route-backoff state. That covers the supporting infrastructure implied by the new split between pool intents and route backoff rows.",
+          "flagged": false
+        }
+      ],
+      "prior_findings": [
+        {
+          "detail": "Verified the previous migration/deployment finding is addressed at plan level: Step 2 now makes schema verification a pre-deploy gate and explicitly avoids boot-time Railway DDL, while still updating the existing migration scripts. That is consistent with the current `railway.json`, which has no migration startup hook.",
+          "flagged": false,
+          "status": "n/a"
+        },
+        {
+          "detail": "Checked the cross-repo debug surface: the revised plan still scopes the app touch to `/Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug.py` and `scripts/debug/commands/scaling_audit.py`, and it adds route-key divergence/backoff/adoption reporting. That covers the new route-aware intent shape without requiring a dashboard or unrelated app changes.",
+          "flagged": false,
+          "status": "n/a"
+        }
+      ]
+    },
+    {
+      "id": "callers",
+      "question": "Find the callers of the changed function. What arguments do they actually pass? Does the fix handle all of them?",
+      "guidance": "Grep for call sites. For each caller, check what values it passes \u2014 especially edge cases like None, zero, empty, or composite inputs. Then ask: should this change be here, or in a caller, callee, or new method?",
+      "findings": [
+        {
+          "detail": "Verified the recurring `CycleSummary` caller finding is addressed: Step 10 now requires reconciler results to carry spawned, terminated, failed, backoff-suppressed, and lease-suppressed counts, and requires `control_loop.py` to fold those counters into `CycleSummary` so health monitoring and structured summaries remain accurate.",
+          "flagged": false
+        },
+        {
+          "detail": "Checked the spawn and cancellation caller paths: Step 9 still replaces or extends `_spawn_worker()` with intent/action metadata before RunPod launch, and Step 10 keeps dedicated pending-spawn cancellation semantics that mark workers terminal even if RunPod termination fails. Those revisions cover the actual current caller behavior in `control_loop.py` and `database.py`.",
+          "flagged": false
+        }
+      ],
+      "prior_findings": [
+        {
+          "detail": "Verified the prior spawn-idempotency caller finding is addressed: Step 9 now requires a capacity-aware spawn helper or an extended `_spawn_worker()` signature, writes `capacity_intent_id`, action ordinal, and `route_key` on the initial worker row before RunPod launch, and checks for an existing tagged worker before launching a pod.",
+          "flagged": false,
+          "status": "n/a"
+        },
+        {
+          "detail": "Verified the prior pending-spawn cancellation failure finding is addressed: Step 10 now requires a dedicated `CancelPendingSpawn` helper that attempts RunPod termination but marks the worker terminal with `runpod_termination_success=true|false` even when the RunPod call fails.",
+          "flagged": false,
+          "status": "n/a"
+        },
+        {
+          "detail": "Callers: Recurring debt: `CycleSummary.workers_terminated` integration is still not specified for reconciler-driven `CancelPendingSpawn` or `TerminateIdle`. Existing `control_loop.py` increments summary counters around early termination and `_terminate_worker()`, and those counters feed health monitoring and structured cycle summaries; the revised plan only explicitly preserves `workers_spawned` semantics in Step 9.",
+          "flagged": true,
+          "status": "addressed"
+        }
+      ]
+    }
+  ],
+  "flags": [
+    {
+      "id": "FLAG-006",
+      "concern": "Shadow row uniqueness: the plan requires exactly one `worker_capacity_intents` summary row per pool per cycle but also allows multiple shadow replicas without a lease and expects deduping later. Because `cycle_count` is local to each process, shadow mode can violate the exact-one-row criterion unless the requirement is scoped to authoritative mode or shadow writes use an idempotent key.",
+      "category": "correctness",
+      "severity_hint": "likely-significant",
+      "evidence": "`control_loop.py` initializes and increments `self.cycle_count` per process; plan Step 8 says shadow does not acquire leases; plan Step 16 says shadow rows may need deduping; success criteria require exactly one pool summary row per pool per cycle."
+    },
+    {
+      "id": "FLAG-007",
+      "concern": "Nullable route-backoff key: `worker_capacity_route_backoffs` is described as keyed by `(pool, route_key)` while using `route_key=NULL` for pool-floor spawns. PostgreSQL cannot enforce a primary key with nullable `route_key`, and a normal unique index permits duplicate NULL rows.",
+      "category": "correctness",
+      "severity_hint": "likely-significant",
+      "evidence": "Plan Step 1 says the route-backoff table is keyed by `(pool, route_key)` and uses `route_key=NULL` for pool-floor actions; PostgreSQL uniqueness semantics treat NULL values as distinct unless an expression or partial unique index handles them explicitly."
+    },
+    {
+      "id": "verifiability-0",
+      "concern": "Criterion 29: requires human verification (subjective_judgment).",
+      "category": "verifiability",
+      "severity_hint": "likely-minor",
+      "status": "open"
+    },
+    {
+      "id": "verifiability-1",
+      "concern": "Criterion 30: requires human verification (subjective_judgment).",
+      "category": "verifiability",
+      "severity_hint": "likely-minor",
+      "status": "open"
+    },
+    {
+      "id": "verifiability-2",
+      "concern": "Criterion 31: requires human verification (observe_runtime_logs).",
+      "category": "verifiability",
+      "severity_hint": "likely-minor",
+      "status": "open"
+    }
+  ],
+  "verified_flag_ids": [
+    "FLAG-004",
+    "FLAG-005",
+    "correctness-1",
+    "correctness-2",
+    "scope",
+    "issue_hints",
+    "callers"
+  ],
+  "disputed_flag_ids": []
+}

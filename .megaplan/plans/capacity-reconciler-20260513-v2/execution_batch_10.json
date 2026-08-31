@@ -1,0 +1,49 @@
+{
+  "output": "Batch 10 blocked. T9 requires before_execute user action U5, and repo-local checks found only the gate definition, not evidence that the post-cutover monitoring window and final cleanup approval were completed.",
+  "files_changed": [
+    ".megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_10.json"
+  ],
+  "commands_run": [
+    "jq -r '.user_actions[] | select(.id==\"U5\")' .megaplan/plans/capacity-reconciler-20260513-v2/finalize.json",
+    "rg -n \"U5|rollback window|post-cutover|scaling-audit --hours 6|authoritative observation|approved final cleanup|final cleanup slice\" .megaplan/plans/capacity-reconciler-20260513-v2 .megaplan -S",
+    "test -w .megaplan/plans/capacity-reconciler-20260513-v2 && test ! -e .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_10.json; echo $?",
+    "rg -n \"U5|scaling-audit --hours 6|24-hour rollback|rollback window|approve.*final cleanup|final cleanup.*approved|awaiting U5\" .megaplan/plans/capacity-reconciler-20260513-v2/user_actions.md .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_*.json .megaplan/plans/capacity-reconciler-20260513-v2/finalize.json -S",
+    "git status --short",
+    "jq -e . .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_10.json >/dev/null",
+    "git status --short .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_10.json gpu_orchestrator/control_loop.py gpu_orchestrator/control/phases"
+  ],
+  "deviations": [
+    "T9 was not executed because U5 blocks T9 and no mechanical evidence of completed post-cutover monitoring, 24-hour rollback window, and approval for the final cleanup slice was present in repository metadata.",
+    "Advisory observation mismatch: executor claimed files not observed in git status/content hash delta: .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_10.json",
+    "Advisory audit finding: Executor claimed changed files not present in git status: /Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug.py, /Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug/commands/scaling_audit.py",
+    "Advisory audit finding: Git status shows changed files not claimed by any task: .megaplan/debt.json, .megaplan/plans/capacity-reconciler-20260513/, .megaplan/schemas/feedback.json, .megaplan/schemas/finalize.json, .megaplan/schemas/review.json, .megaplan/schemas/revise.json",
+    "Advisory audit finding: Sense check SC11 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC12 is missing an executor acknowledgment.",
+    "Advisory audit finding: Tasks left pending after execute (executor never started them): T11, T12"
+  ],
+  "task_updates": [
+    {
+      "task_id": "T9",
+      "status": "blocked",
+      "executor_notes": "Blocked awaiting U5. Mechanically verified from finalize.json that U5 is a before_execute action blocking T9. Searched plan metadata, user actions, existing batch checkpoints, and finalize.json for evidence that `scaling-audit --hours 6` was monitored for 4 hours post-cutover, the 24-hour rollback window elapsed, and final cleanup was approved; found only the gate definition and prior notes that U5 applies to T9. No code deletion or cleanup was attempted. Wrote and validated the batch checkpoint JSON.",
+      "files_changed": [
+        ".megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_10.json"
+      ],
+      "commands_run": [
+        "jq -r '.user_actions[] | select(.id==\"U5\")' .megaplan/plans/capacity-reconciler-20260513-v2/finalize.json",
+        "rg -n \"U5|rollback window|post-cutover|scaling-audit --hours 6|authoritative observation|approved final cleanup|final cleanup slice\" .megaplan/plans/capacity-reconciler-20260513-v2 .megaplan -S",
+        "test -w .megaplan/plans/capacity-reconciler-20260513-v2 && test ! -e .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_10.json; echo $?",
+        "rg -n \"U5|scaling-audit --hours 6|24-hour rollback|rollback window|approve.*final cleanup|final cleanup.*approved|awaiting U5\" .megaplan/plans/capacity-reconciler-20260513-v2/user_actions.md .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_*.json .megaplan/plans/capacity-reconciler-20260513-v2/finalize.json -S",
+        "git status --short",
+        "jq -e . .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_10.json >/dev/null",
+        "git status --short .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_10.json gpu_orchestrator/control_loop.py gpu_orchestrator/control/phases"
+      ]
+    }
+  ],
+  "sense_check_acknowledgments": [
+    {
+      "sense_check_id": "SC9",
+      "executor_note": "Not satisfied in this batch because T9 is blocked awaiting U5. The final cleanup greps were intentionally not used as success evidence because `_handle_early_termination` and `gpu_orchestrator/control/phases/` should remain untouched until U5 is complete."
+    }
+  ]
+}

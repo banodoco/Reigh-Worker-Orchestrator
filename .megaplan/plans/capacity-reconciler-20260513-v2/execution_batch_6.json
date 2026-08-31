@@ -1,0 +1,63 @@
+{
+  "output": "Batch 6 complete. T5 added the reconciler orchestration boundaries for shadow and authoritative modes, including lease handling, record-before-act, action idempotency, route backoff outcome updates, and legacy spawning adoption metadata.",
+  "files_changed": [
+    "gpu_orchestrator/control/capacity_types.py",
+    "gpu_orchestrator/control/capacity_reconciler.py",
+    "tests/gpu_orchestrator/control/test_capacity_reconciler_orchestration.py",
+    ".megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_6.json"
+  ],
+  "commands_run": [
+    "python -m pytest tests/gpu_orchestrator/control/test_capacity_reconciler_orchestration.py -q",
+    "python -m pytest tests/gpu_orchestrator/control -q",
+    "python -m pytest tests/gpu_orchestrator/test_database_capacity_helpers.py tests/scripts/test_sql_migrations.py -q",
+    "python -m py_compile gpu_orchestrator/control/capacity_reconciler.py gpu_orchestrator/control/capacity_types.py",
+    "python -m pytest --tb=no -q --no-header",
+    "python -m pytest tests/test_module_import_coverage.py -q",
+    "jq -e . .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_6.json >/dev/null"
+  ],
+  "deviations": [
+    "Full suite still fails only at `tests/test_module_import_coverage.py::test_runpod_cutover_modules_import_at_runtime` because `scripts.spot_instance_lifetime_test` is missing. This was already observed in prior batches and is unrelated to T5.",
+    "T5 uses an injectable `action_executor` for authoritative side effects. Concrete RunPod spawn/cancel/terminate wiring is intentionally left for T6, while T5 still enforces record-before-act, spawn idempotency lookup, and route backoff success/failure updates around that executor boundary.",
+    "Advisory quality: gpu_orchestrator/control/capacity_reconciler.py grew by 366 lines (threshold 200).",
+    "Advisory quality: tests/gpu_orchestrator/control/test_capacity_reconciler_orchestration.py grew by 267 lines (threshold 200).",
+    "Advisory observation mismatch: executor claimed files not observed in git status/content hash delta: .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_6.json",
+    "Advisory audit finding: Git status shows changed files not claimed by any task: .megaplan/debt.json, .megaplan/plans/capacity-reconciler-20260513/, .megaplan/schemas/feedback.json, .megaplan/schemas/finalize.json, .megaplan/schemas/review.json, .megaplan/schemas/revise.json",
+    "Advisory audit finding: Sense check SC6 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC7 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC8 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC9 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC10 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC11 is missing an executor acknowledgment.",
+    "Advisory audit finding: Sense check SC12 is missing an executor acknowledgment.",
+    "Advisory audit finding: Tasks left pending after execute (executor never started them): T6, T7, T8, T9, T10, T11, T12"
+  ],
+  "task_updates": [
+    {
+      "task_id": "T5",
+      "status": "done",
+      "executor_notes": "Implemented `CapacityReconciler.reconcile()` with explicit `observe`, `plan`, `admit`, `record_pre_act`, `act`, and `record_outcome` boundaries. Shadow mode now inserts an intent row and root-level `system_logs` shadow-intended-action entries only; focused tests verify it does not acquire leases, call the injected executor, mutate workers, or update route backoff state. Authoritative mode acquires a pool lease, re-observes/re-plans/re-admits under the lease, writes one pool summary intent before side effects, skips duplicate spawn actions already represented by `capacity_intent_id` plus action ordinal, dispatches side effects through an injected executor boundary, resets route backoff on spawn success, records route backoff failure on spawn failure, records outcome, and releases the lease. First-authoritative legacy spawning adoption is represented by adopted worker IDs in the pre-act intent/outcome and result, while those workers remain counted as effective capacity and are not cancelled. Added `ReconciliationResult` to `capacity_types.py` and `tests/gpu_orchestrator/control/test_capacity_reconciler_orchestration.py` covering shadow read-only behavior, authoritative lease/record-before-act ordering, spawn idempotency, spawn failure backoff, lease rejection suppression, and legacy spawning adoption. Verification passed for the orchestration test file, full `tests/gpu_orchestrator/control`, database/migration helper tests, and py_compile. Full suite was run and failed only at the already observed missing `scripts.spot_instance_lifetime_test` import, unrelated to T5.",
+      "files_changed": [
+        "gpu_orchestrator/control/capacity_types.py",
+        "gpu_orchestrator/control/capacity_reconciler.py",
+        "tests/gpu_orchestrator/control/test_capacity_reconciler_orchestration.py",
+        ".megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_6.json"
+      ],
+      "commands_run": [
+        "python -m pytest tests/gpu_orchestrator/control/test_capacity_reconciler_orchestration.py -q",
+        "python -m pytest tests/gpu_orchestrator/control -q",
+        "python -m pytest tests/gpu_orchestrator/test_database_capacity_helpers.py tests/scripts/test_sql_migrations.py -q",
+        "python -m py_compile gpu_orchestrator/control/capacity_reconciler.py gpu_orchestrator/control/capacity_types.py",
+        "python -m pytest --tb=no -q --no-header",
+        "python -m pytest tests/test_module_import_coverage.py -q",
+        "jq -e . .megaplan/plans/capacity-reconciler-20260513-v2/execution_batch_6.json >/dev/null"
+      ],
+      "auto_attributed_files": false
+    }
+  ],
+  "sense_check_acknowledgments": [
+    {
+      "sense_check_id": "SC5",
+      "executor_note": "Yes. Shadow mode records intents and shadow logs without leases, executor calls, worker mutations, or backoff updates. Authoritative mode acquires the pool lease before the authoritative re-observe/re-admit, records the intent before action dispatch, skips duplicate spawn actions by capacity intent/action lookup, updates route backoff on spawn success/failure, releases the lease, and records first-cutover legacy spawning adoption in the authoritative intent/result."
+    }
+  ]
+}

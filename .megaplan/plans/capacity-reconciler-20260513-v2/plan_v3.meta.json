@@ -1,0 +1,277 @@
+{
+  "version": 3,
+  "timestamp": "2026-05-13T19:17:35Z",
+  "hash": "sha256:a4e94347b88cdd42c7950303c7e59d657311209fd7beae9f1d71a3b20d4ffc8e",
+  "changes_summary": "Revised the route-aware design so capacity planning and locking are pool-scoped while route keys are used for demand attribution, backoff, and audit. The plan now preserves exactly one pool intent row per cycle, adds route-backoff state instead of independent route capacity planners, uses a pool lease for single-writer safety, and specifies CycleSummary counter integration for reconciler-driven terminations and suppressions.",
+  "flags_addressed": [
+    "correctness-1",
+    "correctness-2",
+    "scope",
+    "FLAG-004",
+    "FLAG-005",
+    "issue_hints",
+    "callers"
+  ],
+  "questions": [],
+  "success_criteria": [
+    {
+      "criterion": "The SQL migration creates `worker_capacity_intents` with the required columns/indexes, a route-backoff state table keyed by `(pool, route_key)`, and a TTL-based pool-scoped `orchestrator_leases` mechanism.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "Migration registration and schema verification are wired into existing migration scripts or documented release commands, and shadow mode is gated on verified schema presence.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff",
+        "run_shell"
+      ]
+    },
+    {
+      "criterion": "`CapacityReconciler` and supporting types/planning modules exist under `gpu_orchestrator/control/` and expose observe, plan, admit, pre-act record, act, and outcome record boundaries.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "The reconciler writes exactly one pool summary row to `worker_capacity_intents` per pool per cycle; route backoff updates do not create extra pool intent rows.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "The reconciler preserves route-scoped demand attribution and `(pool, route_key)` backoff while applying min floor, idle buffer, and max capacity only once at pool level.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "Backoff on one route key does not suppress eligible demand for a different route key in the same pool, but all route demand still competes inside one pool capacity budget.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Multiple selected route keys cannot multiply `min_active_gpus`, `machines_to_keep_idle`, or `max_active_gpus`; pool capacity bounds are enforced once.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Authoritative mode enforces single-writer behavior per pool, not per route, so two reconciler instances cannot both execute side effects for the same pool.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "`excluded_from_capacity_control` workers are neither counted nor mutated by capacity reconciliation, while periodic cleanup still receives excluded workers through the existing cleanup path.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "The pure plan uses one pool desired-capacity formula with explicit precedence among min floor, eligible queued coverage, and busy-worker idle buffer.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Shadow mode records intent rows and shadow system_logs metadata but does not call RunPod, mutate worker rows, update backoff state, or acquire authoritative leases.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "Shadow-mode control-loop ordering is post-lifecycle and pre-legacy-capacity, and this ordering is covered by tests.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "Authoritative mode records an admitted pool intent successfully before executing any spawn, cancellation, or termination side effect.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "RunPod spawn backoff is keyed by `(pool, route_key)` and tests verify 30s, 60s, 120s, 240s cooldowns plus reset on success using an injected fake clock.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Queued-zero replay/cycle tests prove a spawning worker is not cancelled merely because queued work momentarily drops to zero while active work remains in progress.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Cancel hysteresis tests verify cancellation only after the required wall-clock stability window across multiple snapshots or after `valid_until` elapses.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Route-stale workers are excluded from fresh selected-pool effective capacity and covered by tests.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Cutover adoption tests prove pre-existing spawning workers with no prior authoritative intent are counted as pool capacity and not cancelled on first authoritative observe.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Spawn idempotency is implemented by tagging initial worker rows with `capacity_intent_id` and action ordinal before RunPod launch, and duplicate action replay does not double-spawn.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "`CancelPendingSpawn` attempts RunPod termination but marks the worker terminal with failure metadata even when RunPod termination fails, and this behavior is tested.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "Reconciler-driven spawns, pending-spawn cancels, idle terminations, failed spawns, lease suppressions, and backoff suppressions are reflected in reconciler result counters and folded into `CycleSummary` where applicable.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "The shadow, authoritative, and final cleanup slices each have explicit gates, and final deletion gates are not required for the initial shadow slice.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "`_handle_early_termination` is removed in the final cleanup state, and `rg \"_handle_early_termination\"` returns zero matches.",
+      "priority": "must",
+      "requires": [
+        "run_shell"
+      ]
+    },
+    {
+      "criterion": "`gpu_orchestrator/control/phases/` is removed in the final cleanup state and no production or test code imports `gpu_orchestrator.control.phases`.",
+      "priority": "must",
+      "requires": [
+        "run_shell",
+        "read_files"
+      ]
+    },
+    {
+      "criterion": "`reigh-app/scripts/debug.py scaling-audit` is extended to include pool intent summaries, route backoff state, divergence, and intent stability without breaking import/compile.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "run_shell"
+      ]
+    },
+    {
+      "criterion": "Targeted reconciler, scaling, route-stale, route-aware task-count, pool-budget, summary-counter, and excluded-worker tests pass.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "The full repository pytest suite passes after legacy phase tests are rewritten or removed.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "The final design keeps lifecycle probing, promotion, health checks, stale route draining, error cleanup, orphan task reconciliation, and periodic zombie/storage checks intact.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "The implementation avoids changing `system_logs.valid_source_type` and uses `orchestrator_gpu` with metadata tags for shadow intent logs.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "Capacity planning code remains mostly pure and is small enough to reason about without hidden database or RunPod calls in PLAN/ADMIT.",
+      "priority": "should",
+      "requires": [
+        "read_files",
+        "subjective_judgment"
+      ]
+    },
+    {
+      "criterion": "Divergence audit SQL is clear enough for operators to inspect shadow-vs-legacy behavior using pool summaries plus route backoff details over the last 24h.",
+      "priority": "should",
+      "requires": [
+        "read_files",
+        "subjective_judgment"
+      ]
+    },
+    {
+      "criterion": "Production effective utilization reaches at least 70% sustained over 24h after cutover with no user-task failures attributable to the new controller.",
+      "priority": "info",
+      "requires": [
+        "observe_runtime_logs"
+      ]
+    }
+  ],
+  "assumptions": [
+    "The architectural root cause remains the two-controller capacity loop; the latest critique corrects route budgeting and lock scope rather than replacing the approach.",
+    "Capacity limits are pool/orchestrator-level in this repository. Route keys are used for demand attribution, backoff, and audit, not for independent min/max capacity budgets.",
+    "The pool summary row in `worker_capacity_intents` is the required one-row-per-pool-per-cycle audit record; route backoff state is stored separately to satisfy `(pool, route_key)` cooldown semantics.",
+    "Route keys generally come from task-count route totals, not normal worker environment metadata. Existing workers without route-key metadata are still valid pool capacity.",
+    "Boot-time Railway schema mutation is intentionally avoided; migration application and schema verification are pre-deploy gates before enabling shadow mode.",
+    "The rollout remains split into shadow, authoritative cutover, and final cleanup slices. Final deletion acceptance criteria apply to the final cleanup slice, not the initial shadow slice.",
+    "The app debug command touch remains limited to the sibling `reigh-app` scaling-audit command."
+  ],
+  "delta_from_previous_percent": 23.5,
+  "structure_warnings": []
+}

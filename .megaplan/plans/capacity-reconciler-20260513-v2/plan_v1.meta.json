@@ -1,0 +1,186 @@
+{
+  "version": 1,
+  "timestamp": "2026-05-13T19:05:33Z",
+  "hash": "sha256:1f053c65f3acef1d93f4f935bf28bd7a2be66c7cdf67517d62e79fc5b453b350",
+  "questions": [
+    "Should shadow-mode Phase A intentionally reorder lifecycle probing before legacy early termination, since the current production order is early termination before lifecycle probing?",
+    "Should implementation be split into a shadow PR that temporarily keeps legacy early termination for divergence comparison, followed by a cutover cleanup PR that deletes it?",
+    "Is Supabase SQL still applied manually, or should this sprint add an automated Railway migration step before the orchestrator starts?"
+  ],
+  "success_criteria": [
+    {
+      "criterion": "The new SQL migration creates `worker_capacity_intents` with the required columns/index and a lease mechanism suitable for multi-request RunPod side effects.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "The new migration is registered in the repository's migration display/apply scripts or the migration runner is updated to discover it automatically.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "`CapacityReconciler` and pure capacity planning modules exist under `gpu_orchestrator/control/` and implement OBSERVE, PLAN, ADMIT, RECORD, ACT boundaries.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "The pure plan uses one desired-capacity formula with explicit precedence among min floor, queued coverage, and busy-worker idle buffer.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Shadow mode writes intent rows and shadow system_logs metadata but does not call RunPod, mutate worker rows, or update backoff state.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "Authoritative mode records an intent row successfully before executing any spawn, cancellation, or termination side effect.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "Authoritative mode enforces single-writer behavior per `(pool, route_key)` so two reconciler instances cannot both spawn for the same pool at the same time.",
+      "priority": "must",
+      "requires": [
+        "run_tests",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "RunPod spawn backoff is keyed by `(pool, route_key)` and tests verify 30s, 60s, 120s, 240s cooldowns plus reset on success using an injected fake clock.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Queued-zero replay/cycle tests prove a spawning worker is not cancelled merely because queued work momentarily drops to zero while active work remains in progress.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Cancel hysteresis tests verify cancellation only after the required wall-clock stability window across multiple snapshots or after `valid_until` elapses.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Route-stale workers are excluded from fresh-route effective capacity and covered by tests.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "Cutover adoption test proves pre-existing spawning workers with no prior authoritative intent are counted as capacity and not cancelled on first authoritative observe.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "`_handle_early_termination` is removed in the final cleanup state, and `rg \"_handle_early_termination\"` returns zero matches.",
+      "priority": "must",
+      "requires": [
+        "run_shell"
+      ]
+    },
+    {
+      "criterion": "`gpu_orchestrator/control/phases/` is removed in the final cleanup state and no production or test code imports `gpu_orchestrator.control.phases`.",
+      "priority": "must",
+      "requires": [
+        "run_shell",
+        "read_files"
+      ]
+    },
+    {
+      "criterion": "`reigh-app/scripts/debug.py scaling-audit` is extended to include `worker_capacity_intents` without breaking the existing command import/compile path.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "run_shell"
+      ]
+    },
+    {
+      "criterion": "Targeted reconciler, scaling, and route-stale tests pass.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "The full repository pytest suite passes after legacy phase tests are rewritten or removed.",
+      "priority": "must",
+      "requires": [
+        "run_tests"
+      ]
+    },
+    {
+      "criterion": "The final design keeps lifecycle probing, promotion, health checks, stale route draining, error cleanup, orphan task reconciliation, and periodic zombie/storage checks intact.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "The implementation avoids changing `system_logs.valid_source_type` and uses `orchestrator_gpu` with metadata tags for shadow intent logs.",
+      "priority": "must",
+      "requires": [
+        "read_files",
+        "parse_diff"
+      ]
+    },
+    {
+      "criterion": "Capacity planning code remains mostly pure and is small enough to reason about without hidden database or RunPod calls in PLAN/ADMIT.",
+      "priority": "should",
+      "requires": [
+        "read_files",
+        "subjective_judgment"
+      ]
+    },
+    {
+      "criterion": "Divergence audit SQL is clear enough for operators to inspect shadow-vs-legacy behavior over the last 24h.",
+      "priority": "should",
+      "requires": [
+        "read_files",
+        "subjective_judgment"
+      ]
+    },
+    {
+      "criterion": "Production effective utilization reaches at least 70% sustained over 24h after cutover with no user-task failures attributable to the new controller.",
+      "priority": "info",
+      "requires": [
+        "observe_runtime_logs"
+      ]
+    }
+  ],
+  "assumptions": [
+    "The final branch may be staged across shadow, authoritative cutover, and cleanup rather than deployed as one immediate production flip.",
+    "A lease table is acceptable instead of Postgres advisory locks because Supabase client calls cannot hold a DB session lock across RunPod side effects.",
+    "The current pool-wide capacity model remains in scope; cross-pool or per-route rebalancing is not introduced.",
+    "The app debug command touch is made in the sibling `reigh-app` repository at `/Users/peteromalley/Documents/reigh-workspace/reigh-app`."
+  ],
+  "structure_warnings": []
+}

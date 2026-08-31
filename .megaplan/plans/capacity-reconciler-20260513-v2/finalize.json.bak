@@ -1,0 +1,545 @@
+{
+  "tasks": [
+    {
+      "id": "T13",
+      "description": "Read user_actions.md. For each before_execute action, programmatically verify completion using bash tools \u2014 grep .env for required keys, query the migrations table, curl the dev server, etc. Reading the file does NOT count as verification; you must run a command. For actions that genuinely cannot be verified mechanically (manual UI checks), explicitly ask the user. If anything is incomplete or unverifiable, mark this task blocked with reason and STOP.",
+      "depends_on": [],
+      "status": "pending",
+      "executor_notes": "",
+      "files_changed": [],
+      "commands_run": [],
+      "evidence_files": [],
+      "reviewer_verdict": ""
+    },
+    {
+      "id": "T1",
+      "description": "Add the capacity schema migration and migration-gate plumbing: create `sql/20260514000000_create_worker_capacity_intents.sql` with `worker_capacity_intents`, `worker_capacity_route_backoffs` using non-null `route_key` and `__pool_floor__` sentinel semantics, and `orchestrator_leases`; register or auto-discover it in `scripts/apply_sql_migrations.py` and `scripts/show_migrations.py`; add schema verification for all new tables, indexes, primary keys, and observer columns without adding Railway boot-time DDL.",
+      "depends_on": [
+        "T13"
+      ],
+      "status": "pending",
+      "kind": "code",
+      "executor_notes": "",
+      "files_changed": [],
+      "commands_run": [],
+      "auto_attributed_files": null,
+      "evidence_files": [],
+      "reviewer_verdict": "",
+      "stance": null,
+      "stop_signal": null
+    },
+    {
+      "id": "T2",
+      "description": "Add database helpers in `gpu_orchestrator/database.py` for pool intent insert/update, latest authoritative intent reads, shadow observer reads, pool lease acquire/release, route backoff read/update/reset with `__pool_floor__` normalization, root-level `system_logs` metadata insertion, capacity-aware worker creation metadata, and lookup by `capacity_intent_id` plus action ordinal.",
+      "depends_on": [
+        "T13",
+        "T1"
+      ],
+      "status": "pending",
+      "kind": "code",
+      "executor_notes": "",
+      "files_changed": [],
+      "commands_run": [],
+      "auto_attributed_files": null,
+      "evidence_files": [],
+      "reviewer_verdict": "",
+      "stance": null,
+      "stop_signal": null
+    },
+    {
+      "id": "T3",
+      "description": "Create reconciler types and pure planning modules under `gpu_orchestrator/control/`: frozen dataclasses for observed pool state, route demand, plans, admitted plans, intent records, result counters, and actions; add `Clock` injection; implement `build_capacity_plan()` with one pool-scoped desired formula: `min(max_active_gpus, max(min_active_gpus, busy_count + eligible_queued_total, busy_count + max(machines_to_keep_idle, 1)))`; allocate spawn budget by route demand, then pool-floor buffer; implement route-stale exclusion, spawning-as-capacity, idle-only active termination, and wall-clock cancel hysteresis.",
+      "depends_on": [
+        "T13",
+        "T2"
+      ],
+      "status": "pending",
+      "kind": "code",
+      "executor_notes": "",
+      "files_changed": [],
+      "commands_run": [],
+      "auto_attributed_files": null,
+      "evidence_files": [],
+      "reviewer_verdict": "",
+      "stance": null,
+      "stop_signal": null
+    },
+    {
+      "id": "T4",
+      "description": "Implement pool observation in `gpu_orchestrator/control/capacity_reconciler.py` and supporting database calls: preserve `partition_capacity_workers()` and `excluded_from_capacity_control`, derive selected-pool route demand from detailed task counts, infer route counts only when safe, use `__pool_floor__` only for unattributed floor/buffer actions, compute included non-terminal non-route-stale effective capacity, and keep excluded workers visible only to existing cleanup paths.",
+      "depends_on": [
+        "T13",
+        "T3"
+      ],
+      "status": "pending",
+      "kind": "code",
+      "executor_notes": "",
+      "files_changed": [],
+      "commands_run": [],
+      "auto_attributed_files": null,
+      "evidence_files": [],
+      "reviewer_verdict": "",
+      "stance": null,
+      "stop_signal": null
+    },
+    {
+      "id": "T5",
+      "description": "Implement `CapacityReconciler` orchestration with explicit `observe`, `plan`, `admit`, `record_pre_act`, `act`, and `record_outcome` boundaries. Shadow mode must record intent rows and shadow logs only, without leases, RunPod calls, worker mutations, or backoff updates. Authoritative mode must acquire a pool lease, re-admit, write exactly one pool summary intent before side effects, execute actions idempotently, update route backoff on spawn success/failure, release the lease, and adopt pre-existing legacy spawning workers on first authoritative observe.",
+      "depends_on": [
+        "T13",
+        "T4"
+      ],
+      "status": "pending",
+      "kind": "code",
+      "executor_notes": "",
+      "files_changed": [],
+      "commands_run": [],
+      "auto_attributed_files": null,
+      "evidence_files": [],
+      "reviewer_verdict": "",
+      "stance": null,
+      "stop_signal": null
+    },
+    {
+      "id": "T6",
+      "description": "Wire side-effect helpers for spawn, cancel, terminate, idempotency, and result counters: extend or wrap the existing worker spawner so worker rows are tagged with `capacity_intent_id`, `capacity_action_ordinal`, and `spawn_reason_route_key` before RunPod launch; skip duplicate spawn actions already represented by worker metadata; implement `CancelPendingSpawn` as its own helper that attempts RunPod termination when possible but always marks the worker terminal with capacity metadata; fold reconciler counters into `CycleSummary`.",
+      "depends_on": [
+        "T13",
+        "T5"
+      ],
+      "status": "pending",
+      "kind": "code",
+      "executor_notes": "",
+      "files_changed": [],
+      "commands_run": [],
+      "auto_attributed_files": null,
+      "evidence_files": [],
+      "reviewer_verdict": "",
+      "stance": null,
+      "stop_signal": null
+    },
+    {
+      "id": "T7",
+      "description": "Add feature-flag and control-loop integration: add `ORCHESTRATOR_CAPACITY_RECONCILER_MODE=off|shadow|authoritative` in `gpu_orchestrator/config.py` defaulting to `off`; log mode at startup; in shadow mode reorder the cycle so lifecycle probing runs before capacity observation and before legacy capacity actions; run shadow reconciliation from the immutable post-lifecycle snapshot while legacy remains authoritative; in authoritative mode skip legacy `_handle_early_termination`, `_calculate_scaling_decision`, and `_execute_scaling` while preserving lifecycle probing, promotion, health checks, stale route draining, error cleanup, orphan reconciliation, zombie/storage checks, and rollback to `shadow` or `off`.",
+      "depends_on": [
+        "T13",
+        "T6"
+      ],
+      "status": "pending",
+      "kind": "code",
+      "executor_notes": "",
+      "files_changed": [],
+      "commands_run": [],
+      "auto_attributed_files": null,
+      "evidence_files": [],
+      "reviewer_verdict": "",
+      "stance": null,
+      "stop_signal": null
+    },
+    {
+      "id": "T8",
+      "description": "Add operator audit surfaces: commit divergence SQL under `sql/` or `scripts/` comparing shadow intended actions, pool summary intents, route backoff state, legacy worker mutations, lease suppressions, route-count fallback cases, and authoritative one-row-per-pool cycles; extend `/Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug.py` and `reigh-app/scripts/debug/commands/scaling_audit.py` to report pool intent stability, shadow observer dedupe, route backoff windows, divergence counts, latest adoption intents, and existing churn/utilization output.",
+      "depends_on": [
+        "T13",
+        "T7"
+      ],
+      "status": "pending",
+      "kind": "code",
+      "executor_notes": "",
+      "files_changed": [],
+      "commands_run": [],
+      "auto_attributed_files": null,
+      "evidence_files": [],
+      "reviewer_verdict": "",
+      "stance": null,
+      "stop_signal": null
+    },
+    {
+      "id": "T9",
+      "description": "Implement the final cleanup slice after the authoritative observation window: delete `_handle_early_termination` and all call sites from `gpu_orchestrator/control_loop.py`; delete `gpu_orchestrator/control/phases/`; remove or replace imports of `gpu_orchestrator.control.phases`; remove unreachable legacy capacity stubs only after rollback window completion; keep useful intent audit code and remove only shadow comparison code that depends on legacy actions.",
+      "depends_on": [
+        "T13",
+        "T8",
+        "U5"
+      ],
+      "status": "pending",
+      "kind": "code",
+      "executor_notes": "",
+      "files_changed": [],
+      "commands_run": [],
+      "auto_attributed_files": null,
+      "evidence_files": [],
+      "reviewer_verdict": "",
+      "stance": null,
+      "stop_signal": null
+    },
+    {
+      "id": "T10",
+      "description": "Add focused reconciler and runtime safety tests under `tests/control/`: queued-zero no-cancel replay, route-scoped backoff with fake clock including 30/60/120/240 second cooldowns and reset on successful pod creation, pool-floor backoff sentinel uniqueness, pool bounds applied once across multiple routes, pool single-writer lease behavior, cancel hysteresis by wall-clock and `valid_until`, route-stale exclusion, cutover adoption, excluded-worker boundary, result-to-`CycleSummary` counters, realistic incident replay, shadow no-side-effects, record-before-act ordering, spawn idempotency, cancel terminal marking despite RunPod termination failure, shadow ordering post-lifecycle/pre-legacy-capacity, authoritative exact-one-row invariant, and shadow observer dedupe invariants.",
+      "depends_on": [
+        "T13",
+        "T7"
+      ],
+      "status": "pending",
+      "kind": "test",
+      "executor_notes": "",
+      "files_changed": [],
+      "commands_run": [],
+      "auto_attributed_files": null,
+      "evidence_files": [],
+      "reviewer_verdict": "",
+      "stance": null,
+      "stop_signal": null
+    },
+    {
+      "id": "T11",
+      "description": "Update existing tests after the phase deletion: remove phase-mixin smoke tests that only assert existence, port behavior worth keeping to `tests/control/test_capacity_reconciler.py` or production `control_loop.py` tests, update sprint rollback/staging tests that imported `WorkerCapacityPhaseMixin`, and preserve or extend route-aware task count and route-stale tests as needed.",
+      "depends_on": [
+        "T13",
+        "T9",
+        "T10"
+      ],
+      "status": "pending",
+      "kind": "test",
+      "executor_notes": "",
+      "files_changed": [],
+      "commands_run": [],
+      "auto_attributed_files": null,
+      "evidence_files": [],
+      "reviewer_verdict": "",
+      "stance": null,
+      "stop_signal": null
+    },
+    {
+      "id": "T12",
+      "description": "Final verification: write a short throwaway script that reproduces the 2026-05-13 queued-zero spawning-worker churn scenario against the reconciler, run it to prove no premature cancel or oscillation, then delete it. Run the required validation commands and fix/re-run until passing: `python -m pytest tests/control/test_capacity_reconciler.py -q`; `python -m pytest tests/test_scaling_decision_spawn.py tests/test_scaling_decision_limits.py tests/test_route_stale_worker_state.py tests/gpu_orchestrator/test_route_aware_task_counts.py -q`; `python -m pytest tests/gpu_orchestrator tests/test_module_import_coverage.py -q`; `python -m py_compile /Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug.py /Users/peteromalley/Documents/reigh-workspace/reigh-app/scripts/debug/commands/scaling_audit.py`; `python -m pytest -q`; final cleanup greps `rg \"_handle_early_termination\"`, `test ! -d gpu_orchestrator/control/phases`, and `rg \"gpu_orchestrator\\.control\\.phases\"`.",
+      "depends_on": [
+        "T13",
+        "T11"
+      ],
+      "status": "pending",
+      "kind": "test",
+      "executor_notes": "",
+      "files_changed": [],
+      "commands_run": [],
+      "auto_attributed_files": null,
+      "evidence_files": [],
+      "reviewer_verdict": "",
+      "stance": null,
+      "stop_signal": null
+    }
+  ],
+  "watch_items": [
+    "Keep shadow and authoritative semantics separate: exact-one-row applies only to authoritative pool cycles under a lease; shadow rows must include `observer_id` and `observation_id` and be dedupe-aware.",
+    "Never use nullable route keys in `worker_capacity_route_backoffs`; normalize pool-floor/buffer actions to `__pool_floor__` before DB access.",
+    "Route keys are for demand attribution, audit, and backoff only. Pool min, idle buffer, max capacity, and locking are applied once at pool level.",
+    "Do not let `excluded_from_capacity_control` workers leak into capacity counts or mutations; existing cleanup should still see them.",
+    "Shadow mode must not acquire leases, call RunPod, mutate workers, or update backoff state.",
+    "Authoritative mode must record the admitted intent before any RunPod create, cancel, or terminate side effect.",
+    "Backoff reset should follow the approved plan and brief: reset on successful spawn/pod creation for that normalized `(pool, route_key)`, not only on later promotion to active.",
+    "`CancelPendingSpawn` must mark the DB row terminal even if RunPod termination fails, with metadata for cleanup/manual follow-up.",
+    "Cycle ordering in shadow is critical: lifecycle probing first, immutable shadow observation second, legacy capacity actions third.",
+    "Do not apply final deletion gates to the initial shadow slice; `_handle_early_termination` and `control/phases/` are removed only after cutover observation.",
+    "Migration application is an operational pre-deploy gate, not Railway boot-time schema mutation.",
+    "Preserve lifecycle probing, heartbeat promotion, health checks, stale route draining, error cleanup, orphan reconciliation, and periodic zombie/storage checks.",
+    "Avoid changing `system_logs.valid_source_type`; use `orchestrator_gpu` plus metadata tags.",
+    "The replay fixture should be as close as possible to the actual 2026-05-13 14:11-14:14 state; synthetic is acceptable only if real snapshots are unavailable and it reproduces the failure mode.",
+    "Future `sql/` auto-discovery widens migration risk; keep schema verification and operator review explicit."
+  ],
+  "sense_checks": [
+    {
+      "id": "SC1",
+      "task_id": "T1",
+      "question": "Does the migration create all three schema surfaces, enforce non-null `(pool, route_key)` uniqueness for backoffs with `__pool_floor__`, leave `system_logs.valid_source_type` untouched, and provide a schema verification path before shadow mode?",
+      "executor_note": "",
+      "verdict": ""
+    },
+    {
+      "id": "SC2",
+      "task_id": "T2",
+      "question": "Do database helpers support intent pre-act insert and outcome update, route backoff normalization, pool leases, root-level system log metadata, and worker idempotency lookups without requiring hidden schema assumptions?",
+      "executor_note": "",
+      "verdict": ""
+    },
+    {
+      "id": "SC3",
+      "task_id": "T3",
+      "question": "Is planning pure, clock-injected, pool-scoped, and using exactly one desired-capacity formula with route backoff affecting eligible queued demand but not multiplying min/max/buffer by route?",
+      "executor_note": "",
+      "verdict": ""
+    },
+    {
+      "id": "SC4",
+      "task_id": "T4",
+      "question": "Does observation exclude live-test/harness workers from capacity counts and mutations while preserving existing cleanup visibility, and does it handle route demand exact/inferred/fallback cases explicitly?",
+      "executor_note": "",
+      "verdict": ""
+    },
+    {
+      "id": "SC5",
+      "task_id": "T5",
+      "question": "Does reconciler orchestration enforce shadow read-only behavior, authoritative pool lease single-writer behavior, record-before-act ordering, per-route backoff updates, and first-authoritative adoption of legacy spawning workers?",
+      "executor_note": "",
+      "verdict": ""
+    },
+    {
+      "id": "SC6",
+      "task_id": "T6",
+      "question": "Are spawn, cancel, and terminate side effects idempotent and reflected in worker metadata plus `CycleSummary`, including terminal marking when pending-spawn RunPod termination fails?",
+      "executor_note": "",
+      "verdict": ""
+    },
+    {
+      "id": "SC7",
+      "task_id": "T7",
+      "question": "Does the control loop run shadow observation after lifecycle probing and before legacy capacity mutations, and does authoritative mode skip only legacy capacity actions while preserving lifecycle and cleanup behavior?",
+      "executor_note": "",
+      "verdict": ""
+    },
+    {
+      "id": "SC8",
+      "task_id": "T8",
+      "question": "Can operators inspect shadow-vs-legacy divergence, authoritative pool intent stability, shadow observer dedupe, route backoff windows, adoption, and existing utilization/churn from the committed SQL/debug command?",
+      "executor_note": "",
+      "verdict": ""
+    },
+    {
+      "id": "SC9",
+      "task_id": "T9",
+      "question": "After the final cleanup slice, do greps show zero `_handle_early_termination` references, no `gpu_orchestrator/control/phases/` directory, and no imports of `gpu_orchestrator.control.phases`?",
+      "executor_note": "",
+      "verdict": ""
+    },
+    {
+      "id": "SC10",
+      "task_id": "T10",
+      "question": "Do the new tests cover every invariant from queued-zero no-cancel through route backoff, pool-budget bounds, single-writer lease, adoption, excluded workers, idempotency, shadow no-side-effects, and summary counters?",
+      "executor_note": "",
+      "verdict": ""
+    },
+    {
+      "id": "SC11",
+      "task_id": "T11",
+      "question": "Were phase-mixin tests deleted or rewritten without losing meaningful behavior coverage, and do route-aware and route-stale tests still exercise production code paths?",
+      "executor_note": "",
+      "verdict": ""
+    },
+    {
+      "id": "SC12",
+      "task_id": "T12",
+      "question": "Did the throwaway repro script prove the incident churn scenario is fixed, was it deleted afterward, and did all targeted, compile, grep, and full pytest checks pass after any necessary fixes?",
+      "executor_note": "",
+      "verdict": ""
+    },
+    {
+      "id": "SC13",
+      "task_id": "T13",
+      "question": "Were all before_execute user_actions programmatically verified before execution proceeded?",
+      "executor_note": "",
+      "verdict": ""
+    }
+  ],
+  "user_actions": [
+    {
+      "id": "U1",
+      "description": "Apply the new SQL migration through the existing approved database migration process and confirm schema verification passes before enabling `ORCHESTRATOR_CAPACITY_RECONCILER_MODE=shadow`.",
+      "phase": "after_execute",
+      "blocks_task_ids": null,
+      "rationale": "The plan deliberately avoids Railway boot-time DDL; production/staging DB mutation is an operator action after code is ready.",
+      "requires_human_only_reason": null
+    },
+    {
+      "id": "U2",
+      "description": "Deploy the shadow slice with `ORCHESTRATOR_CAPACITY_RECONCILER_MODE=shadow`.",
+      "phase": "after_execute",
+      "blocks_task_ids": null,
+      "rationale": "Environment changes and production deploys are outside repo editing.",
+      "requires_human_only_reason": null
+    },
+    {
+      "id": "U3",
+      "description": "Observe shadow mode for at least 24 hours and at least 50 meaningful capacity events, extending the window if needed; review `scaling-audit` and divergence SQL for unresolved correct-legacy divergence.",
+      "phase": "after_execute",
+      "blocks_task_ids": [
+        "U4"
+      ],
+      "rationale": "Cutover requires production traffic evidence and operator approval.",
+      "requires_human_only_reason": null
+    },
+    {
+      "id": "U4",
+      "description": "After shadow gates pass, deploy the authoritative cutover with `ORCHESTRATOR_CAPACITY_RECONCILER_MODE=authoritative`.",
+      "phase": "after_execute",
+      "blocks_task_ids": null,
+      "rationale": "The feature-flag flip is an operational production action.",
+      "requires_human_only_reason": null
+    },
+    {
+      "id": "U5",
+      "description": "Monitor `scaling-audit --hours 6` for 4 hours post-cutover and wait through the agreed 24-hour rollback window before approving the final cleanup slice.",
+      "phase": "before_execute",
+      "blocks_task_ids": [
+        "T9"
+      ],
+      "rationale": "The final deletion of legacy code should happen only after authoritative mode has been stable enough for rollback confidence.",
+      "requires_human_only_reason": null
+    }
+  ],
+  "meta_commentary": "Execute in deployable slices, not as one risky production flip. Build schema and pure planning first, then shadow integration, then authoritative side effects, then final cleanup. The most important implementation traps are shadow accidentally mutating state, route keys accidentally creating multiple pool budgets, and final cleanup being applied before the production observation gates. Keep the approved plan's distinction between pool-scoped capacity and route-scoped backoff visible in every review.",
+  "validation": {
+    "plan_steps_covered": [
+      {
+        "plan_step_summary": "Step 1: Add capacity-intent, route-backoff, and pool-lease schema.",
+        "finalize_item_ids": [
+          "T1"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 2: Register and gate the migration.",
+        "finalize_item_ids": [
+          "T1",
+          "U1"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 3: Add database helpers.",
+        "finalize_item_ids": [
+          "T2"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 4: Add reconciler data types.",
+        "finalize_item_ids": [
+          "T3"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 5: Preserve the excluded-worker boundary.",
+        "finalize_item_ids": [
+          "T4",
+          "T10"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 6: Build pool observation with route demand.",
+        "finalize_item_ids": [
+          "T4"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 7: Implement pure pool plan computation.",
+        "finalize_item_ids": [
+          "T3",
+          "T10"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 8: Implement reconciler orchestration.",
+        "finalize_item_ids": [
+          "T5"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 9: Make spawn idempotency explicit.",
+        "finalize_item_ids": [
+          "T6",
+          "T10"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 10: Define cancellation, termination, and summary semantics.",
+        "finalize_item_ids": [
+          "T6",
+          "T10"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 11: Implement cutover adoption.",
+        "finalize_item_ids": [
+          "T5",
+          "T10"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 12: Add feature flag plumbing.",
+        "finalize_item_ids": [
+          "T7",
+          "U2",
+          "U4"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 13: Shadow slice integration.",
+        "finalize_item_ids": [
+          "T7",
+          "U2",
+          "U3"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 14: Authoritative cutover slice.",
+        "finalize_item_ids": [
+          "T7",
+          "U3",
+          "U4",
+          "U5"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 15: Final cleanup slice.",
+        "finalize_item_ids": [
+          "T9",
+          "T11",
+          "T12",
+          "U5"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 16: Add divergence SQL.",
+        "finalize_item_ids": [
+          "T8"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 17: Extend app debug audit.",
+        "finalize_item_ids": [
+          "T8",
+          "T12"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 18: Add pool-budget cycle-trace tests.",
+        "finalize_item_ids": [
+          "T10",
+          "T12"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 19: Add runtime safety tests.",
+        "finalize_item_ids": [
+          "T10",
+          "T12"
+        ]
+      },
+      {
+        "plan_step_summary": "Step 20: Update existing tests after phase deletion.",
+        "finalize_item_ids": [
+          "T11",
+          "T12"
+        ]
+      },
+      {
+        "plan_step_summary": "Verify before_execute user_actions",
+        "finalize_item_ids": [
+          "T13"
+        ]
+      }
+    ],
+    "orphan_tasks": [],
+    "completeness_notes": "All approved plan steps are mapped. Human actions cover only operational work that cannot be completed by repo edits: applying migrations, deploying feature-flag modes, observing production shadow/cutover gates, and approving final cleanup. Final deletion gates are intentionally tied to the cleanup slice, not the shadow slice.",
+    "coverage_complete": true
+  },
+  "baseline_test_failures": [],
+  "baseline_test_command": "pytest --tb=no -q --no-header",
+  "baseline_test_note": "No baseline test command was run during briefing finalization; executor should run baseline or targeted tests before and after substantial edits as needed, then complete T12."
+}
